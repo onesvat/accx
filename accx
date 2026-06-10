@@ -37,6 +37,8 @@ Usage:
   accx codex  save <name>
   accx codex  switch <name>
   accx codex  identity [--api]
+  accx claude remove <name>          Delete a saved account
+  accx codex  remove <name>
 
 Options:
   --api   Fetch fresh usage data from API (default: use cache)
@@ -247,6 +249,35 @@ cmd_switch() {
     done < <(auth_files "$provider")
 
     echo "Switched $provider to profile '${C_GREEN}$name${C_OFF}'"
+}
+
+# ============================================================================
+# Remove command
+# ============================================================================
+
+cmd_remove() {
+    local provider="$1"
+    local name="$2"
+
+    if [[ -z "$name" ]]; then
+        echo "ERROR: usage: accx $provider remove <name>" >&2
+        exit 1
+    fi
+
+    local vdir; vdir="$(vault_dir "$provider" "$name")"
+
+    if [[ ! -d "$vdir" ]]; then
+        echo "ERROR: profile '$name' not found" >&2
+        exit 1
+    fi
+
+    if is_active "$provider" "$name"; then
+        echo "WARNING: profile '$name' is currently active." >&2
+        echo "Removing it will NOT affect your live credentials — only the stored copy." >&2
+    fi
+
+    rm -rf "$vdir"
+    echo "Removed $provider profile '${C_RED}$name${C_OFF}'"
 }
 
 # ============================================================================
@@ -524,6 +555,7 @@ main() {
         save)     cmd_save "$provider" "$@" ;;
         switch)   cmd_switch "$provider" "$@" ;;
         identity) cmd_identity "$provider" "$@" ;;
+        remove)   cmd_remove "$provider" "$@" ;;
         -h|--help) usage ;;
         *) echo "ERROR: unknown command '$cmd'" >&2; exit 1 ;;
     esac

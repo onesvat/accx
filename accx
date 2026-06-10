@@ -1,0 +1,532 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly ACCX_HOME="${ACCX_HOME:-$HOME/.accx}"
+readonly SCRIPT_VERSION="1.0.0"
+
+# ============================================================================
+# Color constants (auto-detect TTY)
+# ============================================================================
+
+if [[ -t 1 ]]; then
+    C_RED='\033[1;31m'
+    C_GREEN='\033[1;32m'
+    C_YELLOW='\033[1;33m'
+    C_BOLD='\033[1m'
+    C_DIM='\033[90m'
+    C_OFF='\033[0m'
+else
+    C_RED='' C_GREEN='' C_YELLOW='' C_BOLD='' C_DIM='' C_OFF=''
+fi
+
+# ============================================================================
+# Usage
+# ============================================================================
+
+usage() {
+    cat <<'EOF'
+accx — switch between Claude Code & Codex CLI accounts
+
+Usage:
+  accx claude list [--api]          List saved accounts (cached by default)
+  accx claude save <name>           Save current account
+  accx claude switch <name>         Switch to saved account
+  accx claude identity [--api]      Show active account info
+
+  accx codex  list [--api]
+  accx codex  save <name>
+  accx codex  switch <name>
+  accx codex  identity [--api]
+
+Options:
+  --api   Fetch fresh usage data from API (default: use cache)
+EOF
+    exit 0
+}
+
+# ============================================================================
+# Auth file locations
+# ============================================================================
+
+claude_auth_files() {
+    echo "$HOME/.claude/.credentials.json"
+    echo "$HOME/.claude.json"
+}
+
+codex_auth_files() {
+    local codex_home="${CODEX_HOME:-$HOME/.codex}"
+    echo "$codex_home/auth.json"
+}
+
+auth_files() {
+    case "$1" in
+        claude) claude_auth_files ;;
+        codex)  codex_auth_files ;;
+    esac
+}
+
+# ============================================================================
+# Vault operations
+# ============================================================================
+
+vault_dir() {
+    echo "$ACCX_HOME/$1/$2"
+}
+
+ensure_vault() {
+    mkdir -p "$ACCX_HOME/$1"
+}
+
+list_profiles() {
+    local dir="$ACCX_HOME/$1"
+    if [[ ! -d "$dir" ]]; then
+        return 0
+    fi
+    for d in "$dir"/*/; do
+        [[ -d "$d" ]] || continue
+        local name; name="$(basename "$d")"
+        [[ "$name" == .* ]] && continue
+        echo "$name"
+    done 2>/dev/null | sort
+}
+
+cache_path() {
+    echo "$(vault_dir "$1" "$2")/.usage-cache.json"
+}
+
+# ============================================================================
+# Usage API fetchers
+# ============================================================================
+
+fetch_claude_usage() {
+    local atoken="$1"
+    curl -sf --max-time 5 \
+        -H "Authorization: Bearer $atoken" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || echo ""
+}
+
+fetch_codex_usage() {
+    local atoken="$1"
+    curl -sf --max-time 5 \
+        -H "Authorization: Bearer $atoken" \
+        -H "User-Agent: Mozilla/5.0" \
+        "https://chatgpt.com/backend-api/wham/usage" 2>/dev/null || echo ""
+}
+
+write_usage_cache() {
+    local provider="$1" name="$2" email="$3" p5="$4" p7="$5" r5="$6" r7="$7"
+    local cache; cache="$(cache_path "$provider" "$name")"
+    mkdir -p "$(dirname "$cache")"
+    local now; now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    jq -n \
+        --arg fetched_at "$now" \
+        --arg email "$email" \
+        --argjson p5 "$p5" \
+        --argjson p7 "$p7" \
+        --arg r5 "$r5" \
+        --arg r7 "$r7" \
+        '{fetched_at: $fetched_at, email: $email, five_hour: {utilization: $p5, resets_at: $r5}, seven_day: {utilization: $p7, resets_at: $r7}}' \
+        > "$cache" 2>/dev/null || true
+}
+
+cached_ago_str() {
+    local cache="$1"
+    local fetched_at; fetched_at="$(jq -r '.fetched_at // ""' "$cache")"
+    [[ -z "$fetched_at" ]] && { echo "?"; return; }
+    local epoch_now epoch_cache diff_m
+    epoch_now="$(date +%s)"
+    epoch_cache="$(date -d "$fetched_at" +%s 2>/dev/null || echo 0)"
+    if [[ "$epoch_cache" == "0" ]]; then echo "?"; return; fi
+    diff_m=$(( (epoch_now - epoch_cache) / 60 ))
+    if [[ $diff_m -lt 1 ]]; then echo "now"
+    elif [[ $diff_m -lt 60 ]]; then echo "${diff_m}m ago"
+    else echo "$((diff_m / 60))h ago"
+    fi
+}
+
+usage_color() {
+    local val="$1"
+    if [[ "$val" == "?" ]]; then echo ""; return; fi
+    # Truncate float to int for comparison (bash can't do float arithmetic)
+    local intval="${val%%.*}"
+    if [[ "$intval" -ge 90 ]]; then echo "$C_RED"
+    elif [[ "$intval" -ge 70 ]]; then echo "$C_YELLOW"
+    else echo ""
+    fi
+}
+
+# ============================================================================
+# is_active — compare vault files to live files
+# ============================================================================
+
+is_active() {
+    local provider="$1" name="$2"
+    local vdir; vdir="$(vault_dir "$provider" "$name")"
+    while IFS= read -r src; do
+        [[ -z "$src" ]] && continue
+        cmp -s "$vdir/$(basename "$src")" "$src" 2>/dev/null || return 1
+    done < <(auth_files "$provider")
+    return 0
+}
+
+# ============================================================================
+# Save command
+# ============================================================================
+
+cmd_save() {
+    local provider="$1"
+    local name="$2"
+
+    if [[ -z "$name" ]]; then
+        echo "ERROR: usage: accx $provider save <name>" >&2
+        exit 1
+    fi
+
+    ensure_vault "$provider"
+    local vdir; vdir="$(vault_dir "$provider" "$name")"
+    mkdir -p "$vdir"
+
+    local count=0 missing=0
+    while IFS= read -r src; do
+        [[ -z "$src" ]] && continue
+        if [[ ! -f "$src" ]]; then
+            echo "  ${C_DIM}missing:${C_OFF} $src" >&2
+            missing=$((missing + 1))
+            continue
+        fi
+        cp "$src" "$vdir/$(basename "$src")"
+        count=$((count + 1))
+    done < <(auth_files "$provider")
+
+    if [[ $missing -gt 0 ]]; then
+        echo "WARNING: $missing source file(s) not found. Are you logged in to $provider?" >&2
+        exit 1
+    fi
+
+    echo "Saved $provider profile '${C_GREEN}$name${C_OFF}' ($count files)"
+}
+
+# ============================================================================
+# Switch command
+# ============================================================================
+
+cmd_switch() {
+    local provider="$1"
+    local name="$2"
+
+    if [[ -z "$name" ]]; then
+        echo "ERROR: usage: accx $provider switch <name>" >&2
+        exit 1
+    fi
+
+    local vdir; vdir="$(vault_dir "$provider" "$name")"
+
+    if [[ ! -d "$vdir" ]]; then
+        echo "ERROR: profile '$name' not found" >&2
+        echo "Run 'accx $provider list' to see saved profiles." >&2
+        exit 1
+    fi
+
+    # Verify all required vault files exist
+    while IFS= read -r src; do
+        [[ -z "$src" ]] && continue
+        local fname; fname="$(basename "$src")"
+        if [[ ! -f "$vdir/$fname" ]]; then
+            echo "ERROR: vault file missing: $vdir/$fname" >&2
+            exit 1
+        fi
+    done < <(auth_files "$provider")
+
+    # Restore: vault -> live
+    while IFS= read -r src; do
+        [[ -z "$src" ]] && continue
+        local fname; fname="$(basename "$src")"
+        mkdir -p "$(dirname "$src")"
+        cp "$vdir/$fname" "$src"
+    done < <(auth_files "$provider")
+
+    echo "Switched $provider to profile '${C_GREEN}$name${C_OFF}'"
+}
+
+# ============================================================================
+# Identity command
+# ============================================================================
+
+cmd_identity() {
+    local provider="$1"
+    shift
+
+    local use_api=false
+    for arg in "$@"; do
+        [[ "$arg" == "--api" ]] && use_api=true
+    done
+
+    case "$provider" in
+        claude) identity_claude "$use_api" ;;
+        codex)  identity_codex "$use_api" ;;
+    esac
+}
+
+identity_claude() {
+    local use_api="$1"
+
+    local cfg="$HOME/.claude.json"
+    local creds="$HOME/.claude/.credentials.json"
+
+    if [[ ! -f "$cfg" ]]; then
+        echo "ERROR: ~/.claude.json not found. Are you logged in?" >&2
+        exit 1
+    fi
+
+    local email display plan created billing
+    email="$(jq -r '.oauthAccount.emailAddress // "?"' "$cfg")"
+    display="$(jq -r '.oauthAccount.displayName // "?"' "$cfg")"
+    plan="$(jq -r '.oauthAccount.organizationType // "?"' "$cfg")"
+    created="$(jq -r '.oauthAccount.subscriptionCreatedAt // "?"' "$cfg")"
+    billing="$(jq -r '.oauthAccount.billingType // "?"' "$cfg")"
+
+    echo ""
+    printf "  ${C_BOLD}%s${C_OFF}\n" "Claude Code — Active Account"
+    echo "  ─────────────────────────────────────────"
+    printf "  %-14s ${C_BOLD}%s${C_OFF}\n" "Email:" "$email"
+    printf "  %-14s %s\n" "Name:" "${display:-?}"
+    printf "  %-14s %s\n" "Plan:" "$plan"
+    printf "  %-14s %s\n" "Billing:" "$billing"
+    [[ "$created" != "?" && "$created" != "null" ]] && \
+        printf "  %-14s %s\n" "Sub since:" "${created:0:10}"
+    echo ""
+
+    if [[ "$use_api" == "true" ]] && [[ -f "$creds" ]]; then
+        local atoken; atoken="$(jq -r '.claudeAiOauth.accessToken // empty' "$creds")"
+        if [[ -n "$atoken" && "$atoken" != "null" ]]; then
+            local usage; usage="$(fetch_claude_usage "$atoken")"
+            if [[ -n "$usage" ]]; then
+                local p5 p7 r5 r7 ec el
+                p5="$(echo "$usage" | jq -r '.five_hour.utilization // "?"')"
+                p7="$(echo "$usage" | jq -r '.seven_day.utilization // "?"')"
+                r5="$(echo "$usage" | jq -r '.five_hour.resets_at // ""' | sed 's/T/ /' | cut -d'+' -f1 | cut -d. -f1)"
+                r7="$(echo "$usage" | jq -r '.seven_day.resets_at // ""' | sed 's/T/ /' | cut -d'+' -f1 | cut -d. -f1)"
+                ec="$(echo "$usage" | jq -r '.extra_usage.used_credits // 0')"
+                el="$(echo "$usage" | jq -r '.extra_usage.monthly_limit // 0')"
+
+                local c5; c5="$(usage_color "$p5")"
+                printf "  %-14s ${c5}%s%%${C_OFF}  → resets ${C_DIM}%s${C_OFF}\n" "5h usage:" "$p5" "$r5"
+                printf "  %-14s %s%%   → resets ${C_DIM}%s${C_OFF}\n" "7d usage:" "$p7" "$r7"
+                [[ "$el" != "0" ]] && printf "  %-14s %s / %s credits\n" "Extra:" "$ec" "$el"
+            fi
+        fi
+    fi
+    echo ""
+}
+
+identity_codex() {
+    local use_api="$1"
+
+    local auth_json; auth_json="$(codex_auth_files)"
+
+    if [[ ! -f "$auth_json" ]]; then
+        echo "ERROR: $auth_json not found. Are you logged in?" >&2
+        exit 1
+    fi
+
+    if [[ "$use_api" == "true" ]]; then
+        local atoken; atoken="$(jq -r '.tokens.access_token // .access_token // empty' "$auth_json")"
+        if [[ -n "$atoken" && "$atoken" != "null" ]]; then
+            local info; info="$(fetch_codex_usage "$atoken")"
+            if [[ -n "$info" ]]; then
+                local email plan p5 p7 r5 r7
+                email="$(echo "$info" | jq -r '.email // "?"')"
+                plan="$(echo "$info" | jq -r '.plan_type // "?"')"
+                p5="$(echo "$info" | jq -r '.rate_limit.primary_window.used_percent // "?"')"
+                p7="$(echo "$info" | jq -r '.rate_limit.secondary_window.used_percent // "?"')"
+                local rt1 rt2
+                rt1="$(echo "$info" | jq -r '.rate_limit.primary_window.reset_at // 0')"
+                rt2="$(echo "$info" | jq -r '.rate_limit.secondary_window.reset_at // 0')"
+                [[ "$rt1" != "0" && "$rt1" != "null" ]] && r5="$(date -d "@$rt1" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")"
+                [[ "$rt2" != "0" && "$rt2" != "null" ]] && r7="$(date -d "@$rt2" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")"
+
+                local c5; c5="$(usage_color "$p5")"
+                echo ""
+                printf "  ${C_BOLD}%s${C_OFF}\n" "Codex CLI — Active Account"
+                echo "  ─────────────────────────────────────────"
+                printf "  %-14s ${C_BOLD}%s${C_OFF}\n" "Email:" "$email"
+                printf "  %-14s %s\n" "Plan:" "$plan"
+                printf "  %-14s ${c5}%s%%${C_OFF}  → resets ${C_DIM}%s${C_OFF}\n" "5h usage:" "$p5" "${r5:-?}"
+                printf "  %-14s %s%%   → resets ${C_DIM}%s${C_OFF}\n" "7d usage:" "$p7" "${r7:-?}"
+                echo ""
+                return
+            fi
+        fi
+    fi
+
+    echo ""
+    printf "  ${C_BOLD}%s${C_OFF}\n" "Codex CLI — Active Account"
+    echo "  ─────────────────────────────────────────"
+    echo "  (run with --api for usage data)"
+    echo ""
+}
+
+# ============================================================================
+# List command
+# ============================================================================
+
+cmd_list() {
+    local provider="$1"
+    shift
+
+    local use_api=false
+    for arg in "$@"; do
+        [[ "$arg" == "--api" ]] && use_api=true
+    done
+
+    local dir="$ACCX_HOME/$provider"
+
+    if [[ ! -d "$dir" ]] || [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
+        echo ""
+        echo "  No saved $provider profiles."
+        echo "  Use 'accx $provider save <name>' to save the current account."
+        echo ""
+        return
+    fi
+
+    local names; names="$(list_profiles "$provider")"
+    if [[ -z "$names" ]]; then
+        echo ""
+        echo "  No saved $provider profiles."
+        echo ""
+        return
+    fi
+
+    # Detect active
+    local active=""
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        if is_active "$provider" "$name"; then
+            active="$name"
+            break
+        fi
+    done <<< "$names"
+
+    # Header
+    echo ""
+    printf "  ${C_BOLD}%-14s %-28s %6s %6s  %-17s %-17s${C_OFF}\n" \
+        "PROFILE" "EMAIL" "5H%" "7D%" "5H RESET" "7D RESET"
+
+    local has_cached_data=false
+
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        local vdir; vdir="$(vault_dir "$provider" "$name")"
+
+        local email="?" p5="?" p7="?" r5="" r7=""
+
+        case "$provider" in
+            claude)
+                email="$(jq -r '.oauthAccount.emailAddress // "?"' "$vdir/.claude.json" 2>/dev/null || echo "?")"
+
+                if [[ "$use_api" == "true" ]]; then
+                    local atoken; atoken="$(jq -r '.claudeAiOauth.accessToken // empty' "$vdir/.credentials.json" 2>/dev/null || echo "")"
+                    if [[ -n "$atoken" && "$atoken" != "null" ]]; then
+                        local raw; raw="$(fetch_claude_usage "$atoken")"
+                        if [[ -n "$raw" ]]; then
+                            p5="$(echo "$raw" | jq -r '.five_hour.utilization // "?"')"
+                            p7="$(echo "$raw" | jq -r '.seven_day.utilization // "?"')"
+                            r5="$(echo "$raw" | jq -r '.five_hour.resets_at // ""' | sed 's/T/ /' | cut -d'+' -f1 | cut -d. -f1)"
+                            r7="$(echo "$raw" | jq -r '.seven_day.resets_at // ""' | sed 's/T/ /' | cut -d'+' -f1 | cut -d. -f1)"
+                            write_usage_cache "$provider" "$name" "$email" "$p5" "$p7" "$r5" "$r7"
+                            has_cached_data=true
+                        fi
+                    fi
+                else
+                    local cache; cache="$(cache_path "$provider" "$name")"
+                    if [[ -f "$cache" ]]; then
+                        email="$(jq -r '.email // "?"' "$cache")"
+                        p5="$(jq -r '.five_hour.utilization // "?"' "$cache")"
+                        p7="$(jq -r '.seven_day.utilization // "?"' "$cache")"
+                        r5="$(jq -r '.five_hour.resets_at // ""' "$cache")"
+                        r7="$(jq -r '.seven_day.resets_at // ""' "$cache")"
+                        has_cached_data=true
+                    fi
+                fi
+                ;;
+            codex)
+                if [[ "$use_api" == "true" ]]; then
+                    local atoken; atoken="$(jq -r '.tokens.access_token // .access_token // empty' "$vdir/auth.json" 2>/dev/null || echo "")"
+                    if [[ -n "$atoken" && "$atoken" != "null" ]]; then
+                        local raw; raw="$(fetch_codex_usage "$atoken")"
+                        if [[ -n "$raw" ]]; then
+                            email="$(echo "$raw" | jq -r '.email // "?"')"
+                            p5="$(echo "$raw" | jq -r '.rate_limit.primary_window.used_percent // "?"')"
+                            p7="$(echo "$raw" | jq -r '.rate_limit.secondary_window.used_percent // "?"')"
+                            local rt1 rt2
+                            rt1="$(echo "$raw" | jq -r '.rate_limit.primary_window.reset_at // 0')"
+                            rt2="$(echo "$raw" | jq -r '.rate_limit.secondary_window.reset_at // 0')"
+                            [[ "$rt1" != "0" && "$rt1" != "null" ]] && r5="$(date -d "@$rt1" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")"
+                            [[ "$rt2" != "0" && "$rt2" != "null" ]] && r7="$(date -d "@$rt2" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")"
+                            write_usage_cache "$provider" "$name" "$email" "$p5" "$p7" "$r5" "$r7"
+                            has_cached_data=true
+                        fi
+                    fi
+                else
+                    local cache; cache="$(cache_path "$provider" "$name")"
+                    if [[ -f "$cache" ]]; then
+                        email="$(jq -r '.email // "?"' "$cache")"
+                        p5="$(jq -r '.five_hour.utilization // "?"' "$cache")"
+                        p7="$(jq -r '.seven_day.utilization // "?"' "$cache")"
+                        r5="$(jq -r '.five_hour.resets_at // ""' "$cache")"
+                        r7="$(jq -r '.seven_day.resets_at // ""' "$cache")"
+                        has_cached_data=true
+                    fi
+                fi
+                ;;
+        esac
+
+        local c5; c5="$(usage_color "$p5")"
+        local c7; c7="$(usage_color "$p7")"
+        local marker=" "
+        [[ "$name" == "$active" ]] && marker="${C_GREEN}*${C_OFF}"
+
+        printf "  %s%-13s ${C_DIM}%-26s${C_OFF} ${c5}%5s%%${C_OFF} ${c7}%5s%%${C_OFF}  %-17s %-17s\n" \
+            "$marker" "$name" "${email:0:26}" "${p5}" "${p7}" "${r5:-?}" "${r7:-?}"
+    done <<< "$names"
+
+    # Footer
+    echo ""
+    [[ -n "$active" ]] && printf "  ${C_GREEN}*${C_OFF} = active profile\n"
+    if [[ "$use_api" == "true" ]]; then
+        echo "  ${C_DIM}Refreshed via API${C_OFF}"
+    elif $has_cached_data; then
+        echo "  ${C_DIM}Using cache — add --api to refresh${C_OFF}"
+    else
+        echo "  ${C_DIM}No cache yet — run with --api once to populate${C_OFF}"
+    fi
+    echo ""
+}
+
+# ============================================================================
+# Main dispatch
+# ============================================================================
+
+main() {
+    [[ $# -eq 0 ]] && { usage; }
+    case "$1" in
+        claude|codex) local provider="$1"; shift ;;
+        -h|--help) usage ;;
+        *) echo "ERROR: unknown provider '$1', expected 'claude' or 'codex'" >&2; exit 1 ;;
+    esac
+
+    [[ $# -eq 0 ]] && { usage; }
+
+    local cmd="$1"; shift
+    case "$cmd" in
+        list)     cmd_list "$provider" "$@" ;;
+        save)     cmd_save "$provider" "$@" ;;
+        switch)   cmd_switch "$provider" "$@" ;;
+        identity) cmd_identity "$provider" "$@" ;;
+        -h|--help) usage ;;
+        *) echo "ERROR: unknown command '$cmd'" >&2; exit 1 ;;
+    esac
+}
+
+main "$@"

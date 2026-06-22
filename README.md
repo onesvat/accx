@@ -31,13 +31,13 @@ Scheduler and launch events are written as JSON lines to `~/.accx/wake.log`. Com
 
 Open the **Uyandırma** page in the dashboard (or `/wake.html`) to review every saved schedule, its next run, recent scheduler events, and the captured CLI output.
 
-The server binds only to `127.0.0.1`. Use `accx web --no-open` to skip opening the browser or `accx web --port 9000` to choose another local port.
+The server binds to `127.0.0.1` by default. Use `accx web --no-open` to skip opening the browser, `accx web --port 9000` to choose another local port, or `accx web --bind 0.0.0.0` to listen on all interfaces.
 
 ## Usage
 
 ```
 accx claude|codex <command> [--api]
-accx web [--port PORT] [--no-open]
+accx web [--port PORT] [--bind ADDRESS] [--no-open]
 ```
 
 ### Commands

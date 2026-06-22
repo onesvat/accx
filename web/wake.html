@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ACCX Uyandırma</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-icon">ax</span>
+      <div><h1>ACCX</h1><p>Uyandırma merkezi</p></div>
+    </div>
+    <nav class="main-nav" aria-label="Ana navigasyon">
+      <a href="/">Hesaplar</a>
+      <a class="active" href="/wake.html" aria-current="page">Uyandırma</a>
+    </nav>
+    <div class="header-actions">
+      <div class="sync-state"><i></i><span id="wakeSyncText">Planlar okunuyor</span></div>
+      <button class="button primary" id="refreshWakes" type="button">Yenile</button>
+    </div>
+  </header>
+
+  <main class="page-shell wake-page">
+    <section class="wake-page-head">
+      <div>
+        <p class="eyebrow">ZAMANLAYICI KONTROLÜ</p>
+        <h2>Uyandırma planları ve çalışma kayıtları</h2>
+        <p>Planların sıradaki çalışma zamanlarını ve CLI süreçlerinin gerçek çıktılarını tek ekrandan izle.</p>
+      </div>
+      <div class="scheduler-chip"><i></i> `accx web` sürecine bağlı</div>
+    </section>
+
+    <div class="metrics" id="wakeMetrics" aria-live="polite"></div>
+
+    <section class="wake-section">
+      <div class="section-heading">
+        <div><p class="eyebrow">PLANLAR</p><h2>Kayıtlı zamanlamalar</h2></div>
+        <span id="planCount">0 plan</span>
+      </div>
+      <div class="wake-plan-grid" id="wakePlans" aria-live="polite"></div>
+    </section>
+
+    <section class="wake-section log-section">
+      <div class="section-heading">
+        <div><p class="eyebrow">OLAY GÜNLÜĞÜ</p><h2>Son zamanlayıcı hareketleri</h2></div>
+        <span>En yeni önce · son 200 olay</span>
+      </div>
+      <div class="wake-event-list" id="wakeEvents" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/wake.js" defer></script>
+</body>
+</html>

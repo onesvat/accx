@@ -15,10 +15,29 @@ ln -sf ~/Code/accx/accx ~/.local/bin/accx
 
 Requirements: Python 3.10+.
 
+## Web dashboard
+
+Launch the local dashboard and open it in your browser:
+
+```bash
+accx web
+```
+
+The dashboard combines saved Claude and Codex profiles. It shows current 5-hour and 7-day usage, stores monthly renewal dates, prices, and plan notes, and switches the active CLI profile. Usage is refreshed every 15 minutes while the server is running; use **Refresh usage** for an immediate API refresh.
+
+Each profile can also have an automatic wake schedule. Choose a one-time date or a daily time, enter the prompt, and review the expected five-hour reset window before saving. The scheduler runs in the `accx web` process, so the browser may be closed, but stopping `accx web` also stops scheduled wakes. A wake starts Claude with `haiku` or Codex with `gpt-5.1-codex-mini` in the background using an isolated copy of that profile's credentials, without changing the active terminal account.
+
+Scheduler and launch events are written as JSON lines to `~/.accx/wake.log`. Command output is written to `~/.accx/<provider>/<profile>/.wake-runtime/wake.log` for troubleshooting failed automatic wakes.
+
+Open the **Uyandırma** page in the dashboard (or `/wake.html`) to review every saved schedule, its next run, recent scheduler events, and the captured CLI output.
+
+The server binds only to `127.0.0.1`. Use `accx web --no-open` to skip opening the browser or `accx web --port 9000` to choose another local port.
+
 ## Usage
 
 ```
 accx claude|codex <command> [--api]
+accx web [--port PORT] [--no-open]
 ```
 
 ### Commands
@@ -121,7 +140,8 @@ accx codex identity --api   # live usage from ChatGPT API
 │   ├── work/
 │   │   ├── credential.json
 │   │   ├── meta.json
-│   │   └── .usage-cache.json    # API response cache
+│   │   ├── settings.json         # billing and automatic wake settings
+│   │   └── .usage-cache.json     # latest API response
 │   └── personal/
 │       └── ...
 └── codex/

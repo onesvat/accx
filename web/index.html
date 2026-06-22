@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="accx-token" content="__ACCX_TOKEN__">
+  <title>ACCX Hesap Yönetimi</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-icon">ax</span>
+      <div><h1>ACCX</h1><p>Hesap yönetimi</p></div>
+    </div>
+    <nav class="main-nav" aria-label="Ana navigasyon">
+      <a class="active" href="/" aria-current="page">Hesaplar</a>
+      <a href="/wake.html">Uyandırma</a>
+    </nav>
+    <div class="header-actions">
+      <div class="sync-state"><i></i><span id="syncText">Yerel kasa okunuyor</span></div>
+      <button class="button primary" id="refreshAll" type="button">Tümünü yenile</button>
+    </div>
+  </header>
+
+  <main class="page-shell">
+    <div class="metrics" id="metrics" aria-live="polite"></div>
+    <div id="tablesRoot" aria-live="polite"></div>
+  </main>
+
+  <dialog id="billingDialog">
+    <form method="dialog" class="dialog-shell" id="billingForm">
+      <div class="dialog-head">
+        <div><p class="dialog-label">ABONELİK</p><h2 id="billingTitle">Plan bilgisi</h2></div>
+        <button class="icon-button" data-close-dialog="billingDialog" aria-label="Kapat" type="button">×</button>
+      </div>
+      <input type="hidden" id="billingProvider">
+      <input type="hidden" id="billingProfile">
+      <div class="form-grid">
+        <label>Sonraki yenileme<input id="renewalDate" type="date" required></label>
+        <label>Aylık fiyat<input id="billingAmount" type="number" min="0" step="0.01" placeholder="20.00"></label>
+        <label>Para birimi<input id="billingCurrency" type="text" minlength="3" maxlength="3" placeholder="USD"></label>
+      </div>
+      <label class="note-field">Plan notu<textarea id="billingNote" maxlength="500" rows="3" placeholder="Örn. GitHub Student üzerinden aldım."></textarea></label>
+      <p class="form-note">Tarih geçtiğinde fatura günü korunarak sonraki aya taşınır.</p>
+      <div class="dialog-actions">
+        <button class="button ghost" data-close-dialog="billingDialog" type="button">Vazgeç</button>
+        <button class="button primary" id="saveBilling" value="default" type="submit">Kaydet</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="switchDialog">
+    <div class="dialog-shell compact">
+      <p class="dialog-label">AKTİF PROFİL</p>
+      <h2>Hesap değiştirilsin mi?</h2>
+      <p id="switchDescription" class="dialog-copy"></p>
+      <div class="dialog-actions">
+        <button class="button ghost" id="cancelSwitch" type="button">Vazgeç</button>
+        <button class="button danger" id="confirmSwitch" type="button">Profili etkinleştir</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="wakeDialog" class="wake-dialog">
+    <form method="dialog" class="dialog-shell" id="wakeForm">
+      <div class="dialog-head">
+        <div><p class="dialog-label">OTOMATİK UYANDIRMA</p><h2 id="wakeTitle">Profil zamanlayıcısı</h2></div>
+        <button class="icon-button" data-close-dialog="wakeDialog" aria-label="Kapat" type="button">×</button>
+      </div>
+      <input type="hidden" id="wakeProvider">
+      <input type="hidden" id="wakeProfile">
+      <div class="wake-toggle-row">
+        <div class="schedule-tabs" role="group" aria-label="Tekrarlama">
+          <button type="button" data-recurrence="once">Tek sefer</button>
+          <button type="button" data-recurrence="daily">Her gün</button>
+        </div>
+        <label class="switch-field"><input id="wakeEnabled" type="checkbox"><span></span>Etkin</label>
+      </div>
+      <div class="wake-time-grid">
+        <label id="wakeDateLabel">Tarih<input id="wakeDate" type="date"></label>
+        <label>Saat<input id="wakeTime" type="time" required></label>
+      </div>
+      <label class="note-field">Prompt<textarea id="wakePrompt" maxlength="4000" rows="5" required placeholder="Örn. Kısa bir selamlama yanıtı ver."></textarea></label>
+      <div class="wake-preview" id="wakePreview" aria-live="polite"></div>
+      <p class="form-note">Yalnızca <strong>accx web</strong> süreci çalışırken tetiklenir. Tarayıcının açık olması gerekmez; görev profilin izole kimliğiyle çalışır ve aktif terminal oturumunu değiştirmez.</p>
+      <div class="dialog-actions">
+        <button class="button ghost" data-close-dialog="wakeDialog" type="button">Vazgeç</button>
+        <button class="button primary" value="default" type="submit">Zamanlamayı kaydet</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

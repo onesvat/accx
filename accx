@@ -3,23 +3,38 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import hashlib
 import json
+import mimetypes
 import os
 import platform
+import secrets
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+import webbrowser
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 SCHEMA_VERSION = 2
+WEB_SCHEMA_VERSION = 1
+AUTO_REFRESH_SECONDS = 15 * 60
+WAKE_CHECK_SECONDS = 15
+WAKE_LOG_LOCK = threading.Lock()
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 
 
 class Colors:
@@ -42,6 +57,19 @@ def accx_home() -> Path:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def wake_log(event: str, **details: Any) -> None:
+    entry = {"timestamp": now_iso(), "event": event, **details}
+    path = accx_home() / "wake.log"
+    try:
+        with WAKE_LOG_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as log_file:
+                log_file.write(json.dumps(entry, sort_keys=True, default=str) + "\n")
+            os.chmod(path, 0o600)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"Auto wake log write failed: {exc}", file=sys.stderr)
 
 
 def die(message: str, code: int = 1) -> None:
@@ -115,6 +143,20 @@ def ms_now() -> int:
     return int(time.time() * 1000)
 
 
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def local_today():
+    return datetime.now().astimezone().date()
+
+
 def run_json_command(args: list[str], timeout: int = 8) -> dict[str, Any]:
     try:
         proc = subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False)
@@ -181,6 +223,9 @@ class Provider:
     def stored_cache_path(self, profile: str) -> Path:
         return self.profile_dir(profile) / ".usage-cache.json"
 
+    def stored_settings_path(self, profile: str) -> Path:
+        return self.profile_dir(profile) / "settings.json"
+
     def login_command(self, extra: list[str]) -> list[str]:
         if self.name == "claude":
             return ["claude", "auth", "login", *extra]
@@ -223,6 +268,16 @@ def credential_access_token(provider: Provider, cred: dict[str, Any]) -> str | N
         return oauth.get("accessToken")
     tokens = cred.get("tokens") or {}
     return tokens.get("access_token") or cred.get("access_token")
+
+
+def codex_account_id(cred: dict[str, Any]) -> str | None:
+    tokens = cred.get("tokens") or {}
+    if tokens.get("account_id"):
+        return tokens["account_id"]
+    access_payload = parse_jwt(tokens.get("access_token") or cred.get("access_token"))
+    id_payload = parse_jwt(tokens.get("id_token") or cred.get("id_token"))
+    auth_claims = access_payload.get("https://api.openai.com/auth") or id_payload.get("https://api.openai.com/auth") or {}
+    return auth_claims.get("chatgpt_account_id") or auth_claims.get("account_id")
 
 
 def credential_access_expiry_ms(provider: Provider, cred: dict[str, Any]) -> int | None:
@@ -303,9 +358,11 @@ def codex_metadata(provider: Provider, cred: dict[str, Any]) -> dict[str, Any]:
     access_payload = parse_jwt(tokens.get("access_token") or cred.get("access_token"))
     auth_claims = access_payload.get("https://api.openai.com/auth") or id_payload.get("https://api.openai.com/auth") or {}
 
-    account_id = tokens.get("account_id") or auth_claims.get("chatgpt_account_id") or auth_claims.get("account_id")
+    account_id = codex_account_id(cred)
     user_id = auth_claims.get("chatgpt_user_id") or auth_claims.get("user_id")
     plan = auth_claims.get("chatgpt_plan_type")
+    if plan == "self_serve_business_usage_based":
+        plan = "business"
     email = id_payload.get("email")
     access_exp = credential_access_expiry_ms(provider, cred)
 
@@ -394,7 +451,10 @@ def is_active(provider: Provider, profile: str) -> bool:
     except SystemExit:
         return False
     live_meta = credential_summary(provider, live_cred, live=False)
-    stored_meta = load_profile_meta(provider, profile)
+    try:
+        stored_meta = load_profile_meta(provider, profile)
+    except SystemExit:
+        return False
     live_refresh, live_account, live_org, live_email = profile_key(live_meta)
     stored_refresh, stored_account, stored_org, stored_email = profile_key(stored_meta)
 
@@ -447,7 +507,7 @@ def restore_live_credential(provider: Provider, backup: Path | None) -> None:
         copy_file(saved, live_path)
 
 
-def switch_profile(provider: Provider, profile: str) -> None:
+def perform_switch_profile(provider: Provider, profile: str) -> dict[str, Any]:
     validate_profile_name(profile)
     pdir = provider.profile_dir(profile)
     if not pdir.exists():
@@ -459,7 +519,6 @@ def switch_profile(provider: Provider, profile: str) -> None:
     current = detect_active_profile(provider)
     if current and current != profile:
         save_profile(provider, current, quiet=True)
-        print(f"  {C.dim}auto-saved active profile '{current}' before switch{C.off}")
 
     backup_live_credential(provider, "switch")
     live_path = provider.live_credential_path()
@@ -469,8 +528,24 @@ def switch_profile(provider: Provider, profile: str) -> None:
     if provider.name == "claude":
         update_claude_oauth_account(meta)
 
+    cred = read_credential(provider, live_path)
+    return {
+        "provider": provider.name,
+        "profile": profile,
+        "previous_profile": current,
+        "access_expired_without_refresh": access_expired_without_refresh(provider, cred),
+        "environment_overrides": env_overrides(provider),
+    }
+
+
+def switch_profile(provider: Provider, profile: str) -> None:
+    result = perform_switch_profile(provider, profile)
+    current = result["previous_profile"]
+    if current and current != profile:
+        print(f"  {C.dim}auto-saved active profile '{current}' before switch{C.off}")
+
     print(f"Switched {provider.name} to profile '{C.green}{profile}{C.off}'")
-    warn_if_unusable_token(provider, read_credential(provider, live_path), profile)
+    warn_if_unusable_token(provider, read_credential(provider, provider.live_credential_path()), profile)
     print_env_override_warnings(provider)
 
 
@@ -616,7 +691,12 @@ def print_identity(provider: Provider, use_api: bool) -> None:
     print(f"  {'Access exp:':14} {credential.get('access_expires_at') or '?'}")
 
     if use_api:
-        usage = fetch_usage(provider, cred)
+        active = detect_active_profile(provider)
+        if active:
+            refresh_profile_usage(provider, active, force=True)
+            usage, _ = load_usage_cache(provider, active)
+        else:
+            usage = fetch_usage(provider, cred)
         if usage:
             print_usage(provider, usage)
         else:
@@ -635,6 +715,51 @@ def http_get_json(url: str, headers: dict[str, str]) -> dict[str, Any] | None:
         return None
 
 
+def http_post_form_json(url: str, form: dict[str, str]) -> dict[str, Any] | None:
+    body = urllib.parse.urlencode(form).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
+def refresh_codex_credential(cred: dict[str, Any]) -> bool:
+    refresh = credential_refresh_token(Provider("codex"), cred)
+    if not refresh:
+        return False
+    response = http_post_form_json(
+        CODEX_TOKEN_URL,
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": CODEX_CLIENT_ID,
+        },
+    )
+    if not isinstance(response, dict) or not response.get("access_token"):
+        return False
+
+    tokens = cred.setdefault("tokens", {})
+    tokens["access_token"] = response["access_token"]
+    if response.get("refresh_token"):
+        tokens["refresh_token"] = response["refresh_token"]
+    if response.get("id_token"):
+        tokens["id_token"] = response["id_token"]
+    cred["last_refresh"] = now_iso()
+    return True
+
+
+def codex_token_needs_refresh(cred: dict[str, Any]) -> bool:
+    expiry = credential_access_expiry_ms(Provider("codex"), cred)
+    return expiry is not None and expiry <= ms_now() + 60_000
+
+
 def fetch_usage(provider: Provider, cred: dict[str, Any]) -> dict[str, Any] | None:
     access = credential_access_token(provider, cred)
     if not access:
@@ -644,10 +769,11 @@ def fetch_usage(provider: Provider, cred: dict[str, Any]) -> dict[str, Any] | No
             "https://api.anthropic.com/api/oauth/usage",
             {"Authorization": f"Bearer {access}", "anthropic-beta": "oauth-2025-04-20"},
         )
-    return http_get_json(
-        "https://chatgpt.com/backend-api/wham/usage",
-        {"Authorization": f"Bearer {access}", "User-Agent": "Mozilla/5.0"},
-    )
+    headers = {"Authorization": f"Bearer {access}", "User-Agent": "codex-cli"}
+    account_id = codex_account_id(cred)
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    return http_get_json("https://chatgpt.com/backend-api/wham/usage", headers)
 
 
 def print_usage(provider: Provider, usage: dict[str, Any]) -> None:
@@ -667,13 +793,440 @@ def print_usage(provider: Provider, usage: dict[str, Any]) -> None:
         print(f"  {'7d usage:':14} {secondary.get('used_percent', '?')}%")
 
 
-def usage_cache_values(provider: Provider, profile: str, use_api: bool, cred: dict[str, Any]) -> tuple[str, str, str, str]:
+def reset_value_to_iso(value: Any) -> str | None:
+    if value in (None, "", "?"):
+        return None
+    if isinstance(value, (int, float)):
+        return epoch_to_iso(value)
+    parsed = parse_iso_datetime(str(value))
+    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z") if parsed else str(value)
+
+
+def usage_snapshot(provider: Provider, raw: dict[str, Any], recorded_at: str | None = None) -> dict[str, Any]:
+    if provider.name == "claude":
+        five = raw.get("five_hour") or {}
+        seven = raw.get("seven_day") or {}
+        extra = raw.get("extra_usage") or {}
+        return {
+            "recorded_at": recorded_at or now_iso(),
+            "five_hour": five.get("utilization"),
+            "seven_day": seven.get("utilization"),
+            "five_hour_resets_at": reset_value_to_iso(five.get("resets_at")),
+            "seven_day_resets_at": reset_value_to_iso(seven.get("resets_at")),
+            "extra_usage": {
+                "enabled": bool(extra.get("is_enabled")),
+                "used_credits": extra.get("used_credits"),
+                "monthly_limit": extra.get("monthly_limit"),
+                "currency": extra.get("currency"),
+            },
+        }
+
+    rate = raw.get("rate_limit") or {}
+    primary = rate.get("primary_window") or {}
+    secondary = rate.get("secondary_window") or {}
+    return {
+        "recorded_at": recorded_at or now_iso(),
+        "five_hour": primary.get("used_percent"),
+        "seven_day": secondary.get("used_percent"),
+        "five_hour_resets_at": reset_value_to_iso(primary.get("reset_at")),
+        "seven_day_resets_at": reset_value_to_iso(secondary.get("reset_at")),
+        "allowed": rate.get("allowed"),
+        "limit_reached": rate.get("limit_reached"),
+    }
+
+
+def load_usage_cache(provider: Provider, profile: str) -> tuple[dict[str, Any] | None, str | None]:
+    cache = read_json(provider.stored_cache_path(profile), {}, strict=False)
+    if not isinstance(cache, dict) or not isinstance(cache.get("raw"), dict):
+        return None, None
+    return cache["raw"], cache.get("fetched_at")
+
+
+def renewal_for_month(year: int, month: int, anchor_day: int):
+    return datetime(year, month, min(anchor_day, calendar.monthrange(year, month)[1])).date()
+
+
+def advance_monthly_renewal(value: str, anchor_day: int, today=None) -> str:
+    try:
+        current = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("renewal_date must use YYYY-MM-DD") from exc
+    today = today or local_today()
+    while current < today:
+        year = current.year + (1 if current.month == 12 else 0)
+        month = 1 if current.month == 12 else current.month + 1
+        current = renewal_for_month(year, month, anchor_day)
+    return current.isoformat()
+
+
+def normalize_billing_input(data: dict[str, Any], today=None) -> dict[str, Any]:
+    renewal_date = str(data.get("renewal_date") or "").strip()
+    if not renewal_date:
+        raise ValueError("renewal_date is required")
+    try:
+        parsed_date = datetime.strptime(renewal_date, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("renewal_date must use YYYY-MM-DD") from exc
+    try:
+        anchor_day = int(data.get("anchor_day") or parsed_date.day)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("anchor_day must be a day of month") from exc
+    if not 1 <= anchor_day <= 31:
+        raise ValueError("anchor_day must be between 1 and 31")
+
+    amount_value = data.get("amount")
+    amount = None
+    currency = str(data.get("currency") or "").strip().upper()
+    if amount_value not in (None, ""):
+        try:
+            decimal_amount = Decimal(str(amount_value))
+        except InvalidOperation as exc:
+            raise ValueError("amount must be a number") from exc
+        if not decimal_amount.is_finite() or decimal_amount < 0:
+            raise ValueError("amount must be zero or greater")
+        if decimal_amount.as_tuple().exponent < -2:
+            raise ValueError("amount supports at most two decimal places")
+        if len(currency) != 3 or not currency.isalpha():
+            raise ValueError("currency must be a three-letter code")
+        amount = f"{decimal_amount:.2f}"
+    elif currency and (len(currency) != 3 or not currency.isalpha()):
+        raise ValueError("currency must be a three-letter code")
+
+    note_value = data.get("note")
+    if note_value not in (None, "") and not isinstance(note_value, str):
+        raise ValueError("note must be text")
+    note = str(note_value or "").strip()
+    if len(note) > 500:
+        raise ValueError("note must be 500 characters or fewer")
+
+    return {
+        "renewal_date": advance_monthly_renewal(renewal_date, anchor_day, today=today),
+        "amount": amount,
+        "currency": currency if amount is not None else None,
+        "interval": "monthly",
+        "anchor_day": anchor_day,
+        "note": note or None,
+    }
+
+
+def load_billing(provider: Provider, profile: str) -> dict[str, Any] | None:
+    path = provider.stored_settings_path(profile)
+    settings = read_json(path, {}, strict=False)
+    if not isinstance(settings, dict) or not isinstance(settings.get("billing"), dict):
+        return None
+    original = settings["billing"]
+    try:
+        billing = normalize_billing_input(original)
+    except ValueError:
+        return None
+    if billing != original:
+        settings["schema"] = WEB_SCHEMA_VERSION
+        settings["billing"] = billing
+        write_json(path, settings)
+    return billing
+
+
+def save_billing(provider: Provider, profile: str, data: dict[str, Any]) -> dict[str, Any]:
+    if profile not in list_profiles(provider):
+        raise ValueError(f"profile '{profile}' not found")
+    billing = normalize_billing_input(data)
+    path = provider.stored_settings_path(profile)
+    settings = read_json(path, {}, strict=False)
+    if not isinstance(settings, dict):
+        settings = {}
+    settings["schema"] = WEB_SCHEMA_VERSION
+    settings["billing"] = billing
+    write_json(path, settings)
+    return billing
+
+
+def normalize_wake_input(data: dict[str, Any]) -> dict[str, Any]:
+    enabled = data.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+    recurrence = str(data.get("recurrence") or "").strip()
+    if recurrence not in {"once", "daily"}:
+        raise ValueError("recurrence must be once or daily")
+    time_value = str(data.get("time") or "").strip()
+    try:
+        datetime.strptime(time_value, "%H:%M")
+    except ValueError as exc:
+        raise ValueError("time must use HH:MM") from exc
+    date_value = str(data.get("date") or "").strip() or None
+    if recurrence == "once":
+        try:
+            datetime.strptime(date_value or "", "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("date must use YYYY-MM-DD for a one-time wake") from exc
+    prompt = data.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt is required")
+    prompt = prompt.strip()
+    if len(prompt) > 4000:
+        raise ValueError("prompt must be 4000 characters or fewer")
+    return {
+        "enabled": enabled,
+        "recurrence": recurrence,
+        "date": date_value if recurrence == "once" else None,
+        "time": time_value,
+        "prompt": prompt,
+        "last_run_at": data.get("last_run_at") if isinstance(data.get("last_run_at"), str) else None,
+        "last_result": data.get("last_result") if isinstance(data.get("last_result"), str) else None,
+    }
+
+
+def wake_candidate(wake: dict[str, Any], now: datetime | None = None) -> datetime | None:
+    if not wake.get("enabled"):
+        return None
+    now = now or datetime.now().astimezone()
+    hour, minute = (int(part) for part in wake["time"].split(":"))
+    if wake["recurrence"] == "once":
+        target_date = datetime.strptime(wake["date"], "%Y-%m-%d").date()
+        candidate = datetime.combine(target_date, datetime.min.time(), tzinfo=now.tzinfo).replace(hour=hour, minute=minute)
+        return candidate
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    last_run = parse_iso_datetime(wake.get("last_run_at"))
+    if last_run:
+        last_run = last_run.astimezone(now.tzinfo)
+    if candidate <= now and last_run and last_run >= candidate:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def wake_public_data(wake: dict[str, Any] | None, now: datetime | None = None) -> dict[str, Any] | None:
+    if not wake:
+        return None
+    candidate = wake_candidate(wake, now=now)
+    result = dict(wake)
+    result["next_run_at"] = candidate.isoformat() if candidate else None
+    result["expected_reset_at"] = (candidate + timedelta(hours=5)).isoformat() if candidate else None
+    return result
+
+
+def load_wake(provider: Provider, profile: str) -> dict[str, Any] | None:
+    settings = read_json(provider.stored_settings_path(profile), {}, strict=False)
+    if not isinstance(settings, dict) or not isinstance(settings.get("wake"), dict):
+        return None
+    try:
+        return normalize_wake_input(settings["wake"])
+    except ValueError as exc:
+        wake_log("schedule_invalid", provider=provider.name, profile=profile, error=str(exc))
+        return None
+
+
+def save_wake(provider: Provider, profile: str, data: dict[str, Any]) -> dict[str, Any]:
+    if profile not in list_profiles(provider):
+        raise ValueError(f"profile '{profile}' not found")
+    wake = normalize_wake_input(data)
+    current = load_wake(provider, profile)
+    schedule_changed = not current or any(current.get(key) != wake.get(key) for key in ("recurrence", "date", "time"))
+    if current and not schedule_changed:
+        wake["last_run_at"] = current.get("last_run_at")
+        wake["last_result"] = current.get("last_result")
+    elif wake["recurrence"] == "daily":
+        now = datetime.now().astimezone()
+        candidate = wake_candidate(wake, now=now)
+        if candidate and candidate <= now:
+            wake["last_run_at"] = now.isoformat()
+    path = provider.stored_settings_path(profile)
+    settings = read_json(path, {}, strict=False)
+    if not isinstance(settings, dict):
+        settings = {}
+    settings["schema"] = WEB_SCHEMA_VERSION
+    settings["wake"] = wake
+    write_json(path, settings)
+    wake_log(
+        "schedule_saved",
+        provider=provider.name,
+        profile=profile,
+        enabled=wake["enabled"],
+        recurrence=wake["recurrence"],
+        date=wake["date"],
+        time=wake["time"],
+    )
+    return wake
+
+
+def wake_command(provider: Provider, prompt: str) -> list[str]:
+    if provider.name == "claude":
+        return ["claude", "-p", prompt, "--model", "haiku"]
+    return [
+        "codex",
+        "exec",
+        "--skip-git-repo-check",
+        "--model",
+        "gpt-5.1-codex-mini",
+        prompt,
+    ]
+
+
+def start_wake(provider: Provider, profile: str, wake: dict[str, Any]) -> str:
+    if shutil.which(provider.cli) is None:
+        result = f"failed: {provider.cli} command not found"
+        wake_log("wake_failed", provider=provider.name, profile=profile, error=result)
+        return result
+    runtime_dir = provider.profile_dir(profile) / ".wake-runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    output_path = runtime_dir / "wake.log"
+    credential_name = ".credentials.json" if provider.name == "claude" else "auth.json"
+    copy_file(provider.stored_credential_path(profile), runtime_dir / credential_name)
+    env = os.environ.copy()
+    if provider.name == "claude":
+        env["CLAUDE_CONFIG_DIR"] = str(runtime_dir)
+    else:
+        source_config = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "config.toml"
+        if source_config.exists():
+            copy_file(source_config, runtime_dir / "config.toml")
+        env["CODEX_HOME"] = str(runtime_dir)
+    try:
+        with output_path.open("ab") as output:
+            process = subprocess.Popen(
+                wake_command(provider, wake["prompt"]),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        result = f"failed: {exc}"
+        wake_log("wake_failed", provider=provider.name, profile=profile, error=result)
+        return result
+    wake_log(
+        "wake_started",
+        provider=provider.name,
+        profile=profile,
+        pid=process.pid,
+        output=str(output_path),
+    )
+
+    def record_completion() -> None:
+        exit_code = process.wait()
+        wake_log(
+            "wake_completed",
+            provider=provider.name,
+            profile=profile,
+            pid=process.pid,
+            exit_code=exit_code,
+            output=str(output_path),
+        )
+
+    if isinstance(process.pid, int):
+        threading.Thread(target=record_completion, name=f"accx-wake-{process.pid}", daemon=True).start()
+    return "started"
+
+
+def process_due_wakes(now: datetime | None = None) -> list[dict[str, Any]]:
+    now = now or datetime.now().astimezone()
+    results = []
+    for provider_name in ("claude", "codex"):
+        provider = Provider(provider_name)
+        for profile in list_profiles(provider):
+            try:
+                wake = load_wake(provider, profile)
+                if not wake:
+                    continue
+                candidate = wake_candidate(wake, now=now)
+                if not candidate or candidate > now:
+                    continue
+                wake_log(
+                    "wake_due",
+                    provider=provider_name,
+                    profile=profile,
+                    scheduled_at=candidate.isoformat(),
+                )
+                result = start_wake(provider, profile, wake)
+                wake["last_result"] = result
+                if result == "started":
+                    wake["last_run_at"] = now.isoformat()
+                    if wake["recurrence"] == "once":
+                        wake["enabled"] = False
+                path = provider.stored_settings_path(profile)
+                settings = read_json(path, {}, strict=False)
+                settings = settings if isinstance(settings, dict) else {}
+                settings["schema"] = WEB_SCHEMA_VERSION
+                settings["wake"] = wake
+                write_json(path, settings)
+                results.append({"provider": provider_name, "profile": profile, "result": result})
+            except Exception as exc:
+                wake_log(
+                    "wake_check_failed",
+                    provider=provider_name,
+                    profile=profile,
+                    error=str(exc),
+                    traceback=traceback.format_exc(),
+                )
+    return results
+
+
+def read_text_tail(path: Path, max_bytes: int = 65536) -> str:
+    try:
+        with path.open("rb") as source:
+            source.seek(0, os.SEEK_END)
+            size = source.tell()
+            source.seek(max(0, size - max_bytes))
+            data = source.read()
+    except OSError:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    if size > max_bytes and "\n" in text:
+        text = text.split("\n", 1)[1]
+    return text.rstrip()
+
+
+def wake_monitor_data(event_limit: int = 200) -> dict[str, Any]:
+    plans = []
+    for provider_name in ("claude", "codex"):
+        provider = Provider(provider_name)
+        for profile in list_profiles(provider):
+            wake = load_wake(provider, profile)
+            if not wake:
+                continue
+            public = wake_public_data(wake) or {}
+            plans.append({
+                "provider": provider_name,
+                "profile": profile,
+                "model": "haiku" if provider_name == "claude" else "gpt-5.1-codex-mini",
+                "output": read_text_tail(provider.profile_dir(profile) / ".wake-runtime" / "wake.log"),
+                **public,
+            })
+
+    events = []
+    for line in read_text_tail(accx_home() / "wake.log", max_bytes=256 * 1024).splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return {
+        "generated_at": now_iso(),
+        "plans": plans,
+        "events": list(reversed(events[-event_limit:])),
+    }
+
+
+def usage_cache_values(
+    provider: Provider,
+    profile: str,
+    use_api: bool,
+    cred: dict[str, Any],
+    active: bool = False,
+) -> tuple[str, str, str, str]:
     cache_path = provider.stored_cache_path(profile)
     raw = None
     if use_api:
+        if provider.name == "codex":
+            refreshed = codex_token_needs_refresh(cred) and refresh_codex_credential(cred)
+            if refreshed and active:
+                write_json(provider.live_credential_path(), cred)
+            if refreshed or active:
+                write_json(provider.stored_credential_path(profile), cred)
+                write_json(provider.stored_meta_path(profile), credential_summary(provider, cred))
         raw = fetch_usage(provider, cred)
         if raw:
-            write_json(cache_path, {"fetched_at": now_iso(), "raw": raw})
+            fetched_at = now_iso()
+            write_json(cache_path, {"fetched_at": fetched_at, "raw": raw})
     else:
         cache = read_json(cache_path, {}, strict=False)
         if isinstance(cache, dict):
@@ -716,11 +1269,13 @@ def list_command(provider: Provider, use_api: bool) -> None:
         cred_path = provider.stored_credential_path(profile)
         if not cred_path.exists():
             continue
+        if profile == active and provider.live_credential_path().exists():
+            cred_path = provider.live_credential_path()
         cred = read_credential(provider, cred_path)
-        meta = load_profile_meta(provider, profile)
+        p5, p7, _, _ = usage_cache_values(provider, profile, use_api, cred, active=profile == active)
+        meta = credential_summary(provider, cred) if provider.name == "codex" else load_profile_meta(provider, profile)
         ident = meta.get("identity") or {}
         cmeta = meta.get("credential") or {}
-        p5, p7, _, _ = usage_cache_values(provider, profile, use_api, cred)
         marker = "*" if profile == active else " "
         email = (ident.get("email") or "?")[:28]
         plan = (ident.get("plan") or "?")[:10]
@@ -731,6 +1286,119 @@ def list_command(provider: Provider, use_api: bool) -> None:
         print("  * = active profile")
     print("  Refreshed via API" if use_api else "  Using cache; add --api to refresh")
     print()
+
+
+def profile_credential(provider: Provider, profile: str, active: str | None = None) -> dict[str, Any]:
+    active = active if active is not None else detect_active_profile(provider)
+    path = provider.live_credential_path() if profile == active and provider.live_credential_path().exists() else provider.stored_credential_path(profile)
+    return read_credential(provider, path)
+
+
+def profile_dashboard_data(provider: Provider, profile: str, active: str | None = None) -> dict[str, Any]:
+    active = active if active is not None else detect_active_profile(provider)
+    cred = profile_credential(provider, profile, active)
+    meta = credential_summary(provider, cred) if provider.name == "codex" else load_profile_meta(provider, profile)
+    ident = meta.get("identity") or {}
+    credential = meta.get("credential") or {}
+    raw, fetched_at = load_usage_cache(provider, profile)
+    usage = usage_snapshot(provider, raw, recorded_at=fetched_at) if raw else None
+    return {
+        "provider": provider.name,
+        "profile": profile,
+        "active": profile == active,
+        "email": ident.get("email"),
+        "display_name": ident.get("display_name"),
+        "plan": ident.get("plan"),
+        "access_expires_at": credential.get("access_expires_at"),
+        "usage": usage,
+        "billing": load_billing(provider, profile),
+        "wake": wake_public_data(load_wake(provider, profile)),
+    }
+
+
+def dashboard_data() -> dict[str, Any]:
+    profiles = []
+    totals: dict[str, Decimal] = {}
+    for provider_name in ("claude", "codex"):
+        provider = Provider(provider_name)
+        active = detect_active_profile(provider)
+        for profile in list_profiles(provider):
+            if not provider.stored_credential_path(profile).exists():
+                continue
+            try:
+                item = profile_dashboard_data(provider, profile, active)
+            except SystemExit:
+                item = {
+                    "provider": provider.name,
+                    "profile": profile,
+                    "active": profile == active,
+                    "email": None,
+                    "display_name": None,
+                    "plan": None,
+                    "access_expires_at": None,
+                    "usage": None,
+                    "billing": load_billing(provider, profile),
+                    "wake": wake_public_data(load_wake(provider, profile)),
+                    "error": "profile data could not be read",
+                }
+            profiles.append(item)
+            billing = item.get("billing") or {}
+            if billing.get("amount") is not None and billing.get("currency"):
+                currency = billing["currency"]
+                totals[currency] = totals.get(currency, Decimal("0")) + Decimal(billing["amount"])
+    return {
+        "generated_at": now_iso(),
+        "auto_refresh_seconds": AUTO_REFRESH_SECONDS,
+        "profiles": profiles,
+        "monthly_totals": {currency: f"{amount:.2f}" for currency, amount in sorted(totals.items())},
+    }
+
+
+def cache_is_fresh(provider: Provider, profile: str, max_age: int = AUTO_REFRESH_SECONDS) -> bool:
+    _, fetched_at = load_usage_cache(provider, profile)
+    fetched = parse_iso_datetime(fetched_at)
+    return bool(fetched and (datetime.now(timezone.utc) - fetched).total_seconds() < max_age)
+
+
+def refresh_profile_usage(provider: Provider, profile: str, force: bool = False) -> dict[str, Any]:
+    if profile not in list_profiles(provider):
+        raise ValueError(f"profile '{profile}' not found")
+    active = detect_active_profile(provider)
+    if not force and cache_is_fresh(provider, profile):
+        return {"profile": profile, "provider": provider.name, "status": "cached"}
+    cred = profile_credential(provider, profile, active)
+    before_raw, _ = load_usage_cache(provider, profile)
+    cache_path = provider.stored_cache_path(profile)
+    before_mtime = cache_path.stat().st_mtime_ns if cache_path.exists() else None
+    usage_cache_values(provider, profile, True, cred, active=profile == active)
+    raw, fetched_at = load_usage_cache(provider, profile)
+    after_mtime = cache_path.stat().st_mtime_ns if cache_path.exists() else None
+    if raw is None or after_mtime == before_mtime:
+        return {
+            "profile": profile,
+            "provider": provider.name,
+            "status": "unavailable",
+            "has_cached_data": before_raw is not None,
+        }
+    return {"profile": profile, "provider": provider.name, "status": "refreshed", "fetched_at": fetched_at}
+
+
+def refresh_dashboard_usage(provider_name: str | None = None, profile: str | None = None, force: bool = False) -> list[dict[str, Any]]:
+    if provider_name is not None and provider_name not in {"claude", "codex"}:
+        raise ValueError("provider must be claude or codex")
+    if profile is not None and not provider_name:
+        raise ValueError("provider is required when profile is specified")
+    if profile is not None and profile not in list_profiles(Provider(provider_name)):
+        raise ValueError(f"profile '{profile}' not found")
+    results = []
+    names = (provider_name,) if provider_name else ("claude", "codex")
+    for name in names:
+        provider = Provider(name)
+        targets = (profile,) if profile else tuple(list_profiles(provider))
+        for target in targets:
+            if target and provider.stored_credential_path(target).exists():
+                results.append(refresh_profile_usage(provider, target, force=force))
+    return results
 
 
 def paths_command(provider: Provider) -> None:
@@ -749,6 +1417,200 @@ def paths_command(provider: Provider) -> None:
     print()
 
 
+class DashboardState:
+    def __init__(self) -> None:
+        self.token = secrets.token_urlsafe(32)
+        self.lock = threading.Lock()
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    server_version = "accx-dashboard"
+    state: DashboardState
+    asset_root: Path
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        print(f"  {self.address_string()} - {fmt % args}")
+
+    def send_bytes(self, status: int, body: bytes, content_type: str, cache: bool = False) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "public, max-age=300" if cache else "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+            )
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    def send_json(self, status: int, data: Any) -> None:
+        self.send_bytes(status, json.dumps(data, separators=(",", ":")).encode("utf-8"), "application/json; charset=utf-8")
+
+    def read_json_body(self) -> dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid content length") from exc
+        if length > 65536:
+            raise ValueError("request body is too large")
+        try:
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("request body must be valid JSON") from exc
+        if not isinstance(data, dict):
+            raise ValueError("request body must be a JSON object")
+        return data
+
+    def mutation_allowed(self) -> bool:
+        host = self.headers.get("Host", "").split(":", 1)[0]
+        return (
+            host in {"127.0.0.1", "localhost"}
+            and self.headers.get("X-ACCX-Token") == self.state.token
+            and self.headers.get("Content-Type", "").split(";", 1)[0] == "application/json"
+        )
+
+    def serve_asset(self, requested: str) -> None:
+        filename = "index.html" if requested == "/" else requested.removeprefix("/")
+        if filename not in {"index.html", "app.js", "wake.html", "wake.js", "styles.css"}:
+            self.send_json(404, {"error": "not found"})
+            return
+        path = self.asset_root / filename
+        if not path.exists():
+            self.send_json(500, {"error": "dashboard asset missing"})
+            return
+        body = path.read_bytes()
+        if filename == "index.html":
+            body = body.replace(b"__ACCX_TOKEN__", self.state.token.encode("ascii"))
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        self.send_bytes(200, body, f"{content_type}; charset=utf-8", cache=filename != "index.html")
+
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if not parsed.path.startswith("/api/"):
+            self.serve_asset(parsed.path)
+            return
+        try:
+            if parsed.path == "/api/dashboard":
+                with self.state.lock:
+                    data = dashboard_data()
+                self.send_json(200, data)
+                return
+            if parsed.path == "/api/wakes":
+                with self.state.lock:
+                    data = wake_monitor_data()
+                self.send_json(200, data)
+                return
+            self.send_json(404, {"error": "not found"})
+        except (ValueError, TypeError) as exc:
+            self.send_json(400, {"error": str(exc)})
+        except SystemExit:
+            self.send_json(500, {"error": "dashboard data could not be read"})
+        except Exception:
+            self.send_json(500, {"error": "dashboard request failed"})
+
+    def do_POST(self) -> None:
+        self.handle_mutation("POST")
+
+    def do_PUT(self) -> None:
+        self.handle_mutation("PUT")
+
+    def handle_mutation(self, method: str) -> None:
+        if not self.mutation_allowed():
+            self.send_json(403, {"error": "forbidden"})
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        try:
+            data = self.read_json_body()
+            with self.state.lock:
+                if method == "POST" and parsed.path == "/api/usage/refresh":
+                    force = data.get("force", False)
+                    if not isinstance(force, bool):
+                        raise ValueError("force must be a boolean")
+                    results = refresh_dashboard_usage(data.get("provider"), data.get("profile"), force)
+                    self.send_json(200, {"results": results, "dashboard": dashboard_data()})
+                    return
+                parts = [urllib.parse.unquote(part) for part in parsed.path.strip("/").split("/")]
+                if len(parts) == 5 and parts[:2] == ["api", "profiles"]:
+                    provider = Provider(parts[2])
+                    profile = parts[3]
+                    if method == "POST" and parts[4] == "switch":
+                        if profile not in list_profiles(provider):
+                            raise ValueError(f"profile '{profile}' not found")
+                        result = perform_switch_profile(provider, profile)
+                        self.send_json(200, {"result": result, "dashboard": dashboard_data()})
+                        return
+                    if method == "PUT" and parts[4] == "billing":
+                        billing = save_billing(provider, profile, data)
+                        self.send_json(200, {"billing": billing, "dashboard": dashboard_data()})
+                        return
+                    if method == "PUT" and parts[4] == "wake":
+                        wake = save_wake(provider, profile, data)
+                        self.send_json(200, {"wake": wake_public_data(wake), "dashboard": dashboard_data()})
+                        return
+                self.send_json(404, {"error": "not found"})
+        except (ValueError, TypeError) as exc:
+            self.send_json(400, {"error": str(exc)})
+        except SystemExit:
+            self.send_json(500, {"error": "profile operation failed"})
+        except Exception:
+            self.send_json(500, {"error": "dashboard request failed"})
+
+
+def run_web_dashboard(port: int, open_browser: bool = True) -> None:
+    if not 1 <= port <= 65535:
+        die("web port must be between 1 and 65535")
+    asset_root = Path(__file__).resolve().parent / "web"
+    if not (asset_root / "index.html").exists():
+        die(f"dashboard assets not found: {asset_root}")
+    state = DashboardState()
+
+    class Handler(DashboardHandler):
+        pass
+
+    Handler.state = state
+    Handler.asset_root = asset_root
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as exc:
+        die(f"could not start dashboard on port {port}: {exc}")
+    url = f"http://127.0.0.1:{server.server_port}/"
+    print(f"ACCX dashboard: {url}")
+    print("Press Ctrl+C to stop.")
+    if open_browser:
+        threading.Timer(0.2, lambda: webbrowser.open(url)).start()
+    scheduler_stop = threading.Event()
+    wake_log("scheduler_started", check_interval_seconds=WAKE_CHECK_SECONDS)
+
+    def run_scheduler() -> None:
+        while not scheduler_stop.is_set():
+            try:
+                with state.lock:
+                    results = process_due_wakes()
+                for result in results:
+                    print(f"Auto wake {result['provider']}/{result['profile']}: {result['result']}")
+            except Exception as exc:
+                wake_log("scheduler_check_failed", error=str(exc), traceback=traceback.format_exc())
+                print(f"Auto wake check failed: {exc}", file=sys.stderr)
+            scheduler_stop.wait(WAKE_CHECK_SECONDS)
+
+    scheduler = threading.Thread(target=run_scheduler, name="accx-wake-scheduler", daemon=True)
+    scheduler.start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nDashboard stopped.")
+    finally:
+        scheduler_stop.set()
+        scheduler.join(timeout=2)
+        wake_log("scheduler_stopped")
+        server.server_close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="accx",
@@ -758,6 +1620,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"accx {VERSION}")
 
     sub = parser.add_subparsers(dest="provider", required=True)
+    web_p = sub.add_parser("web", help="open the local account dashboard")
+    web_p.add_argument("--port", type=int, default=8765, help="local port (default: 8765)")
+    web_p.add_argument("--no-open", action="store_true", help="do not open a browser")
+
     for provider_name in ("claude", "codex"):
         p = sub.add_parser(provider_name)
         commands = p.add_subparsers(dest="command", required=True)
@@ -787,6 +1653,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.provider == "web":
+        run_web_dashboard(args.port, open_browser=not args.no_open)
+        return 0
     provider = Provider(args.provider)
 
     if args.command == "list":

@@ -802,6 +802,14 @@ def reset_value_to_iso(value: Any) -> str | None:
     return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z") if parsed else str(value)
 
 
+def format_reset_time(value: Any) -> str:
+    normalized = reset_value_to_iso(value)
+    parsed = parse_iso_datetime(normalized)
+    if parsed is None:
+        return "?"
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
 def usage_snapshot(provider: Provider, raw: dict[str, Any], recorded_at: str | None = None) -> dict[str, Any]:
     if provider.name == "claude":
         five = raw.get("five_hour") or {}
@@ -1239,8 +1247,8 @@ def usage_cache_values(
         return (
             str(five.get("utilization", "?")),
             str(seven.get("utilization", "?")),
-            str(five.get("resets_at", "?"))[:16],
-            str(seven.get("resets_at", "?"))[:16],
+            format_reset_time(five.get("resets_at")),
+            format_reset_time(seven.get("resets_at")),
         )
     rate = raw.get("rate_limit") or {}
     primary = rate.get("primary_window") or {}
@@ -1248,8 +1256,8 @@ def usage_cache_values(
     return (
         str(primary.get("used_percent", "?")),
         str(secondary.get("used_percent", "?")),
-        str(primary.get("reset_at", "?")),
-        str(secondary.get("reset_at", "?")),
+        format_reset_time(primary.get("reset_at")),
+        format_reset_time(secondary.get("reset_at")),
     )
 
 
@@ -1264,7 +1272,10 @@ def list_command(provider: Provider, use_api: bool) -> None:
 
     active = detect_active_profile(provider)
     print()
-    print(f"  {C.bold}{'PROFILE':14} {'EMAIL':28} {'PLAN':10} {'EXP':20} {'5H%':>6} {'7D%':>6}{C.off}")
+    print(
+        f"  {C.bold}{'PROFILE':14} {'EMAIL':28} {'PLAN':10} {'EXP':20} "
+        f"{'5H%':>6} {'5H RESET':16} {'7D%':>6} {'7D RESET':16}{C.off}"
+    )
     for profile in profiles:
         cred_path = provider.stored_credential_path(profile)
         if not cred_path.exists():
@@ -1272,7 +1283,9 @@ def list_command(provider: Provider, use_api: bool) -> None:
         if profile == active and provider.live_credential_path().exists():
             cred_path = provider.live_credential_path()
         cred = read_credential(provider, cred_path)
-        p5, p7, _, _ = usage_cache_values(provider, profile, use_api, cred, active=profile == active)
+        p5, p7, r5, r7 = usage_cache_values(
+            provider, profile, use_api, cred, active=profile == active
+        )
         meta = credential_summary(provider, cred) if provider.name == "codex" else load_profile_meta(provider, profile)
         ident = meta.get("identity") or {}
         cmeta = meta.get("credential") or {}
@@ -1280,7 +1293,10 @@ def list_command(provider: Provider, use_api: bool) -> None:
         email = (ident.get("email") or "?")[:28]
         plan = (ident.get("plan") or "?")[:10]
         exp = (cmeta.get("access_expires_at") or "?")[:20]
-        print(f"  {marker}{profile[:13]:13} {C.dim}{email:28}{C.off} {plan:10} {exp:20} {p5:>5}% {p7:>5}%")
+        print(
+            f"  {marker}{profile[:13]:13} {C.dim}{email:28}{C.off} "
+            f"{plan:10} {exp:20} {p5:>5}% {r5:16} {p7:>5}% {r7:16}"
+        )
     print()
     if active:
         print("  * = active profile")

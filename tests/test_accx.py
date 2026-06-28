@@ -1,4 +1,5 @@
 import base64
+import io
 import json
 import os
 import runpy
@@ -8,6 +9,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -104,6 +106,112 @@ class CodexUsageTests(unittest.TestCase):
         token = jwt({"exp": int(time.time()) - 60})
 
         self.assertTrue(ACCX["codex_token_needs_refresh"]({"tokens": {"access_token": token}}))
+
+
+class ListUsageTests(unittest.TestCase):
+    def test_reset_times_are_formatted_in_local_time(self):
+        epoch = 1782666000
+        expected_epoch = (
+            datetime.fromtimestamp(epoch, timezone.utc)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M")
+        )
+        expected_iso = (
+            datetime(2026, 6, 28, 17, 0, tzinfo=timezone.utc)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M")
+        )
+
+        self.assertEqual(ACCX["format_reset_time"](epoch), expected_epoch)
+        self.assertEqual(
+            ACCX["format_reset_time"]("2026-06-28T17:00:00Z"),
+            expected_iso,
+        )
+        self.assertEqual(ACCX["format_reset_time"]("invalid"), "?")
+        self.assertEqual(ACCX["format_reset_time"](None), "?")
+
+    def test_usage_cache_formats_claude_and_codex_reset_times(self):
+        five_reset = "2026-06-28T17:00:00Z"
+        seven_reset = 1782994200
+        expected = (
+            ACCX["format_reset_time"](five_reset),
+            ACCX["format_reset_time"](seven_reset),
+        )
+        cases = {
+            "claude": {
+                "five_hour": {"utilization": 10, "resets_at": five_reset},
+                "seven_day": {"utilization": 20, "resets_at": seven_reset},
+            },
+            "codex": {
+                "rate_limit": {
+                    "primary_window": {"used_percent": 10, "reset_at": five_reset},
+                    "secondary_window": {"used_percent": 20, "reset_at": seven_reset},
+                }
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"ACCX_HOME": temp}
+        ):
+            for provider_name, raw in cases.items():
+                with self.subTest(provider=provider_name):
+                    provider = ACCX["Provider"](provider_name)
+                    profile_dir = provider.profile_dir("work")
+                    profile_dir.mkdir(parents=True)
+                    provider.stored_cache_path("work").write_text(
+                        json.dumps({"raw": raw})
+                    )
+
+                    values = ACCX["usage_cache_values"](
+                        provider, "work", False, {}
+                    )
+
+                    self.assertEqual(values[2:], expected)
+
+    def test_api_list_prints_reset_columns_and_values(self):
+        five_reset = "2026-06-28T17:00:00Z"
+        seven_reset = "2026-07-02T09:30:00Z"
+        expected_five = ACCX["format_reset_time"](five_reset)
+        expected_seven = ACCX["format_reset_time"](seven_reset)
+        raw = {
+            "five_hour": {"utilization": 10, "resets_at": five_reset},
+            "seven_day": {"utilization": 20, "resets_at": seven_reset},
+        }
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"ACCX_HOME": temp}
+        ):
+            profile_dir = Path(temp) / "claude" / "work"
+            profile_dir.mkdir(parents=True)
+            (profile_dir / "credential.json").write_text(
+                json.dumps({"claudeAiOauth": {"accessToken": "access"}})
+            )
+            (profile_dir / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "identity": {
+                            "email": "work@example.com",
+                            "plan": "pro",
+                        },
+                        "credential": {},
+                    }
+                )
+            )
+            output = io.StringIO()
+            with redirect_stdout(output), patch.dict(
+                ACCX["list_command"].__globals__,
+                {
+                    "detect_active_profile": Mock(return_value=None),
+                    "fetch_usage": Mock(return_value=raw),
+                },
+            ):
+                ACCX["list_command"](ACCX["Provider"]("claude"), True)
+
+        rendered = output.getvalue()
+        self.assertIn("5H RESET", rendered)
+        self.assertIn("7D RESET", rendered)
+        self.assertIn(expected_five, rendered)
+        self.assertIn(expected_seven, rendered)
 
 
 class DashboardDataTests(unittest.TestCase):

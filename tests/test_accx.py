@@ -110,29 +110,36 @@ class CodexUsageTests(unittest.TestCase):
 
 class ListUsageTests(unittest.TestCase):
     def test_reset_times_are_formatted_in_local_time(self):
-        epoch = 1782666000
-        expected_epoch = (
-            datetime.fromtimestamp(epoch, timezone.utc)
-            .astimezone()
-            .strftime("%Y-%m-%d %H:%M")
-        )
-        expected_iso = (
-            datetime(2026, 6, 28, 17, 0, tzinfo=timezone.utc)
-            .astimezone()
-            .strftime("%Y-%m-%d %H:%M")
-        )
+        local_tz = datetime.now().astimezone().tzinfo
+        now = datetime(2026, 6, 28, 18, 0, 30, tzinfo=local_tz)
+        same_day = datetime(2026, 6, 28, 20, 15, tzinfo=local_tz)
+        next_day = datetime(2026, 6, 29, 1, 0, tzinfo=local_tz)
+        past = datetime(2026, 6, 28, 17, 0, tzinfo=local_tz)
+        epoch_reset = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc)
+        epoch = int(epoch_reset.timestamp())
 
-        self.assertEqual(ACCX["format_reset_time"](epoch), expected_epoch)
         self.assertEqual(
-            ACCX["format_reset_time"]("2026-06-28T17:00:00Z"),
-            expected_iso,
+            ACCX["format_reset_time"](same_day.isoformat(), now=now),
+            "20:15 (2h 15m)",
         )
-        self.assertEqual(ACCX["format_reset_time"]("invalid"), "?")
-        self.assertEqual(ACCX["format_reset_time"](None), "?")
+        self.assertEqual(
+            ACCX["format_reset_time"](next_day.isoformat(), now=now),
+            "2026-06-29 01:00",
+        )
+        self.assertEqual(
+            ACCX["format_reset_time"](past.isoformat(), now=now),
+            "17:00",
+        )
+        self.assertEqual(
+            ACCX["format_reset_time"](epoch, now=now),
+            epoch_reset.astimezone().strftime("%Y-%m-%d %H:%M"),
+        )
+        self.assertEqual(ACCX["format_reset_time"]("invalid", now=now), "?")
+        self.assertEqual(ACCX["format_reset_time"](None, now=now), "?")
 
     def test_usage_cache_formats_claude_and_codex_reset_times(self):
-        five_reset = "2026-06-28T17:00:00Z"
-        seven_reset = 1782994200
+        five_reset = "2030-01-01T12:00:00Z"
+        seven_reset = 1893585600
         expected = (
             ACCX["format_reset_time"](five_reset),
             ACCX["format_reset_time"](seven_reset),
@@ -169,8 +176,8 @@ class ListUsageTests(unittest.TestCase):
                     self.assertEqual(values[2:], expected)
 
     def test_api_list_prints_reset_columns_and_values(self):
-        five_reset = "2026-06-28T17:00:00Z"
-        seven_reset = "2026-07-02T09:30:00Z"
+        five_reset = "2030-01-01T12:00:00Z"
+        seven_reset = "2030-01-08T09:30:00Z"
         expected_five = ACCX["format_reset_time"](five_reset)
         expected_seven = ACCX["format_reset_time"](seven_reset)
         raw = {

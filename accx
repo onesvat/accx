@@ -6,6 +6,7 @@ import base64
 import calendar
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import platform
@@ -802,12 +803,23 @@ def reset_value_to_iso(value: Any) -> str | None:
     return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z") if parsed else str(value)
 
 
-def format_reset_time(value: Any) -> str:
+def format_reset_time(value: Any, now: datetime | None = None) -> str:
     normalized = reset_value_to_iso(value)
     parsed = parse_iso_datetime(normalized)
     if parsed is None:
         return "?"
-    return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
+    reset = parsed.astimezone()
+    current = (now or datetime.now().astimezone()).astimezone()
+    if reset.date() != current.date():
+        return reset.strftime("%Y-%m-%d %H:%M")
+    absolute = reset.strftime("%H:%M")
+    remaining_seconds = (reset - current).total_seconds()
+    if remaining_seconds <= 0:
+        return absolute
+    remaining_minutes = math.ceil(remaining_seconds / 60)
+    hours, minutes = divmod(remaining_minutes, 60)
+    parts = ([f"{hours}h"] if hours else []) + ([f"{minutes}m"] if minutes else [])
+    return f"{absolute} ({' '.join(parts)})"
 
 
 def usage_snapshot(provider: Provider, raw: dict[str, Any], recorded_at: str | None = None) -> dict[str, Any]:

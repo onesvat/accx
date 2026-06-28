@@ -811,7 +811,9 @@ def format_usage_percent(value: Any, width: int = 8) -> str:
         elif used >= 80:
             style = C.yellow
         else:
-            style = C.green
+            style = ""
+    if not style:
+        return f"{label:>{width}}"
     return f"{style}{label:>{width}}{C.off}"
 
 

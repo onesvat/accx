@@ -131,8 +131,8 @@ class ListUsageTests(unittest.TestCase):
         formatter = ACCX["format_usage_percent"]
         with patch.dict(formatter.__globals__, {"C": colors}):
             self.assertEqual(formatter("0"), "<gray>      0%<off>")
-            self.assertEqual(formatter("1"), "<green>      1%<off>")
-            self.assertEqual(formatter("79"), "<green>     79%<off>")
+            self.assertEqual(formatter("1"), "      1%")
+            self.assertEqual(formatter("79"), "     79%")
             self.assertEqual(formatter("80"), "<yellow>     80%<off>")
             self.assertEqual(formatter("90"), "<red>     90%<off>")
             self.assertEqual(
@@ -261,8 +261,9 @@ class ListUsageTests(unittest.TestCase):
                 ACCX["list_command"](ACCX["Provider"]("claude"), True)
 
         rendered = output.getvalue()
-        self.assertIn("<green>     10%<off>", rendered)
-        self.assertIn("<green>     20%<off>", rendered)
+        self.assertNotIn("<green>", rendered)
+        self.assertIn("     10%", rendered)
+        self.assertIn("     20%", rendered)
         self.assertIn("5H USED%", rendered)
         self.assertIn("7D USED%", rendered)
         self.assertIn("5H RESET", rendered)

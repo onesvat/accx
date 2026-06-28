@@ -215,6 +215,8 @@ class ListUsageTests(unittest.TestCase):
                 ACCX["list_command"](ACCX["Provider"]("claude"), True)
 
         rendered = output.getvalue()
+        self.assertIn("5H USED%", rendered)
+        self.assertIn("7D USED%", rendered)
         self.assertIn("5H RESET", rendered)
         self.assertIn("7D RESET", rendered)
         self.assertIn(expected_five, rendered)

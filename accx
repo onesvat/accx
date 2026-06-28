@@ -1286,7 +1286,8 @@ def list_command(provider: Provider, use_api: bool) -> None:
     print()
     print(
         f"  {C.bold}{'PROFILE':14} {'EMAIL':28} {'PLAN':10} {'EXP':20} "
-        f"{'5H%':>6} {'5H RESET':16} {'7D%':>6} {'7D RESET':16}{C.off}"
+        f"{'5H USED%':>8} {'5H RESET':16} "
+        f"{'7D USED%':>8} {'7D RESET':16}{C.off}"
     )
     for profile in profiles:
         cred_path = provider.stored_credential_path(profile)
@@ -1307,7 +1308,7 @@ def list_command(provider: Provider, use_api: bool) -> None:
         exp = (cmeta.get("access_expires_at") or "?")[:20]
         print(
             f"  {marker}{profile[:13]:13} {C.dim}{email:28}{C.off} "
-            f"{plan:10} {exp:20} {p5:>5}% {r5:16} {p7:>5}% {r7:16}"
+            f"{plan:10} {exp:20} {p5:>7}% {r5:16} {p7:>7}% {r7:16}"
         )
     print()
     if active:

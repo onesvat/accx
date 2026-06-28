@@ -46,6 +46,7 @@ class Colors:
         self.yellow = "\033[1;33m" if enabled else ""
         self.bold = "\033[1m" if enabled else ""
         self.dim = "\033[90m" if enabled else ""
+        self.strike = "\033[9m" if enabled else ""
         self.off = "\033[0m" if enabled else ""
 
 
@@ -794,6 +795,26 @@ def print_usage(provider: Provider, usage: dict[str, Any]) -> None:
         print(f"  {'7d usage:':14} {secondary.get('used_percent', '?')}%")
 
 
+def format_usage_percent(value: Any, width: int = 8) -> str:
+    label = f"{value}%"
+    try:
+        used = float(value)
+    except (TypeError, ValueError):
+        style = C.dim
+    else:
+        if not math.isfinite(used) or used <= 0:
+            style = C.dim
+        elif used >= 100:
+            style = f"{C.red}{C.strike}"
+        elif used >= 90:
+            style = C.red
+        elif used >= 80:
+            style = C.yellow
+        else:
+            style = C.green
+    return f"{style}{label:>{width}}{C.off}"
+
+
 def reset_value_to_iso(value: Any) -> str | None:
     if value in (None, "", "?"):
         return None
@@ -1308,7 +1329,8 @@ def list_command(provider: Provider, use_api: bool) -> None:
         exp = (cmeta.get("access_expires_at") or "?")[:20]
         print(
             f"  {marker}{profile[:13]:13} {C.dim}{email:28}{C.off} "
-            f"{plan:10} {exp:20} {p5:>7}% {r5:16} {p7:>7}% {r7:16}"
+            f"{plan:10} {exp:20} {format_usage_percent(p5)} {r5:16} "
+            f"{format_usage_percent(p7)} {r7:16}"
         )
     print()
     if active:

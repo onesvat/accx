@@ -109,6 +109,38 @@ class CodexUsageTests(unittest.TestCase):
 
 
 class ListUsageTests(unittest.TestCase):
+    def test_usage_percent_colors_reflect_remaining_capacity(self):
+        self.assertIn("format_usage_percent", ACCX)
+        with patch("sys.stdout.isatty", return_value=True), patch.dict(
+            os.environ, {"NO_COLOR": ""}
+        ):
+            self.assertEqual(ACCX["Colors"]().strike, "\033[9m")
+
+        colors = type(
+            "TestColors",
+            (),
+            {
+                "red": "<red>",
+                "green": "<green>",
+                "yellow": "<yellow>",
+                "dim": "<gray>",
+                "strike": "<strike>",
+                "off": "<off>",
+            },
+        )()
+        formatter = ACCX["format_usage_percent"]
+        with patch.dict(formatter.__globals__, {"C": colors}):
+            self.assertEqual(formatter("0"), "<gray>      0%<off>")
+            self.assertEqual(formatter("1"), "<green>      1%<off>")
+            self.assertEqual(formatter("79"), "<green>     79%<off>")
+            self.assertEqual(formatter("80"), "<yellow>     80%<off>")
+            self.assertEqual(formatter("90"), "<red>     90%<off>")
+            self.assertEqual(
+                formatter("100"),
+                "<red><strike>    100%<off>",
+            )
+            self.assertEqual(formatter("?"), "<gray>      ?%<off>")
+
     def test_reset_times_are_formatted_in_local_time(self):
         local_tz = datetime.now().astimezone().tzinfo
         now = datetime(2026, 6, 28, 18, 0, 30, tzinfo=local_tz)
@@ -184,6 +216,19 @@ class ListUsageTests(unittest.TestCase):
             "five_hour": {"utilization": 10, "resets_at": five_reset},
             "seven_day": {"utilization": 20, "resets_at": seven_reset},
         }
+        colors = type(
+            "TestColors",
+            (),
+            {
+                "red": "<red>",
+                "green": "<green>",
+                "yellow": "<yellow>",
+                "bold": "<bold>",
+                "dim": "<gray>",
+                "strike": "<strike>",
+                "off": "<off>",
+            },
+        )()
 
         with tempfile.TemporaryDirectory() as temp, patch.dict(
             os.environ, {"ACCX_HOME": temp}
@@ -210,11 +255,14 @@ class ListUsageTests(unittest.TestCase):
                 {
                     "detect_active_profile": Mock(return_value=None),
                     "fetch_usage": Mock(return_value=raw),
+                    "C": colors,
                 },
             ):
                 ACCX["list_command"](ACCX["Provider"]("claude"), True)
 
         rendered = output.getvalue()
+        self.assertIn("<green>     10%<off>", rendered)
+        self.assertIn("<green>     20%<off>", rendered)
         self.assertIn("5H USED%", rendered)
         self.assertIn("7D USED%", rendered)
         self.assertIn("5H RESET", rendered)

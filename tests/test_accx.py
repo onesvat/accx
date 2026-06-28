@@ -130,16 +130,18 @@ class ListUsageTests(unittest.TestCase):
         )()
         formatter = ACCX["format_usage_percent"]
         with patch.dict(formatter.__globals__, {"C": colors}):
-            self.assertEqual(formatter("0"), "<gray>      0%<off>")
+            self.assertEqual(formatter("0"), "      <gray>0%<off>")
             self.assertEqual(formatter("1"), "      1%")
-            self.assertEqual(formatter("79"), "     79%")
-            self.assertEqual(formatter("80"), "<yellow>     80%<off>")
-            self.assertEqual(formatter("90"), "<red>     90%<off>")
+            self.assertEqual(formatter("59"), "     59%")
+            self.assertEqual(formatter("60"), "     <yellow>60%<off>")
+            self.assertEqual(formatter("79"), "     <yellow>79%<off>")
+            self.assertEqual(formatter("80"), "     <red>80%<off>")
+            self.assertEqual(formatter("99"), "     <red>99%<off>")
             self.assertEqual(
                 formatter("100"),
-                "<red><strike>    100%<off>",
+                "    <red><strike>100%<off>",
             )
-            self.assertEqual(formatter("?"), "<gray>      ?%<off>")
+            self.assertEqual(formatter("?"), "      <gray>?%<off>")
 
     def test_reset_times_are_formatted_in_local_time(self):
         local_tz = datetime.now().astimezone().tzinfo

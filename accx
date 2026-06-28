@@ -806,15 +806,16 @@ def format_usage_percent(value: Any, width: int = 8) -> str:
             style = C.dim
         elif used >= 100:
             style = f"{C.red}{C.strike}"
-        elif used >= 90:
-            style = C.red
         elif used >= 80:
+            style = C.red
+        elif used >= 60:
             style = C.yellow
         else:
             style = ""
+    padding = " " * max(width - len(label), 0)
     if not style:
-        return f"{label:>{width}}"
-    return f"{style}{label:>{width}}{C.off}"
+        return f"{padding}{label}"
+    return f"{padding}{style}{label}{C.off}"
 
 
 def reset_value_to_iso(value: Any) -> str | None:

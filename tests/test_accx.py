@@ -9,7 +9,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -408,6 +408,208 @@ class DashboardDataTests(unittest.TestCase):
         self.assertNotIn("token", json.dumps(data))
 
 
+class SessionGuardTests(unittest.TestCase):
+    def test_claude_config_dir_controls_metadata_path(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"CLAUDE_CONFIG_DIR": temp}
+        ):
+            provider = ACCX["Provider"]("claude")
+            self.assertEqual(provider.live_metadata_path(), Path(temp) / ".claude.json")
+
+    def test_switch_updates_metadata_in_config_dir(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            home.mkdir()
+            cfg = Path(temp) / "cfg"
+            cfg.mkdir()
+            vault = Path(temp) / "vault"
+            profile_dir = vault / "claude" / "work"
+            profile_dir.mkdir(parents=True)
+            (profile_dir / "credential.json").write_text(
+                json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r"}})
+            )
+            (profile_dir / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "identity": {},
+                        "credential": {},
+                        "claude": {"oauthAccount": {"emailAddress": "work@example.com"}},
+                    }
+                )
+            )
+            (cfg / ".claude.json").write_text(
+                json.dumps(
+                    {
+                        "userID": "user-1",
+                        "oauthAccount": {"emailAddress": "old@example.com"},
+                    }
+                )
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "ACCX_HOME": str(vault),
+                    "CLAUDE_CONFIG_DIR": str(cfg),
+                    "HOME": str(home),
+                },
+            ):
+                ACCX["perform_switch_profile"](
+                    ACCX["Provider"]("claude"), "work", check_sessions=False
+                )
+
+            saved = json.loads((cfg / ".claude.json").read_text())
+            self.assertEqual(saved["oauthAccount"]["emailAddress"], "work@example.com")
+            self.assertEqual(saved["userID"], "user-1")
+            self.assertFalse((home / ".claude.json").exists())
+
+    def test_background_helpers_are_not_active_sessions(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"HOME": temp}, clear=True
+        ):
+            is_process = ACCX["_is_provider_process"]
+            claude = ACCX["Provider"]("claude")
+            codex = ACCX["Provider"]("codex")
+
+            self.assertTrue(
+                is_process(claude, ["claude"], "/opt/claude", {"HOME": temp})
+            )
+            self.assertFalse(
+                is_process(
+                    claude,
+                    ["claude", "--chrome-native-host"],
+                    "/opt/claude",
+                    {"HOME": temp},
+                )
+            )
+            self.assertFalse(
+                is_process(
+                    claude, ["claude", "mcp"], "/opt/claude", {"HOME": temp}
+                )
+            )
+            self.assertTrue(
+                is_process(codex, ["codex", "exec", "hello"], "/opt/codex", {"HOME": temp})
+            )
+            self.assertFalse(
+                is_process(
+                    codex,
+                    ["codex", "app-server", "--listen", "unix://"],
+                    "/opt/codex",
+                    {"HOME": temp},
+                )
+            )
+
+    def test_active_session_blocks_switch_without_killing(self):
+        session = {
+            "pid": 1234,
+            "command": "claude",
+            "ancestor": False,
+            "start_time": 1,
+        }
+        guard = ACCX["ensure_no_active_sessions"]
+        with patch.dict(
+            guard.__globals__, {"find_active_sessions": Mock(return_value=[session])}
+        ):
+            with self.assertRaises(ACCX["ActiveSessionsError"]) as denied:
+                guard(ACCX["Provider"]("claude"), "switch", interactive=False)
+        self.assertEqual(denied.exception.sessions, [session])
+
+    def test_interactive_confirmation_can_stop_sessions(self):
+        session = {
+            "pid": 1234,
+            "command": "claude",
+            "ancestor": False,
+            "start_time": 1,
+        }
+        guard = ACCX["ensure_no_active_sessions"]
+        terminate = Mock()
+        with patch.dict(
+            guard.__globals__,
+            {
+                "find_active_sessions": Mock(return_value=[session]),
+                "_terminate_sessions": terminate,
+            },
+        ), patch("sys.stdin.isatty", return_value=True), patch(
+            "builtins.input", return_value="y"
+        ), redirect_stderr(io.StringIO()):
+            guard(ACCX["Provider"]("claude"), "switch", interactive=True)
+
+        terminate.assert_called_once_with([session])
+
+    def test_ancestor_session_is_never_killed(self):
+        session = {
+            "pid": 1234,
+            "command": "claude",
+            "ancestor": True,
+            "start_time": 1,
+        }
+        guard = ACCX["ensure_no_active_sessions"]
+        terminate = Mock()
+        with patch.dict(
+            guard.__globals__,
+            {
+                "find_active_sessions": Mock(return_value=[session]),
+                "_terminate_sessions": terminate,
+            },
+        ):
+            with self.assertRaises(ACCX["ActiveSessionsError"]):
+                guard(
+                    ACCX["Provider"]("claude"),
+                    "switch",
+                    kill_active=True,
+                    interactive=False,
+                )
+        terminate.assert_not_called()
+
+    def test_codex_usage_refresh_does_not_rotate_live_token_during_session(self):
+        expired = jwt({"exp": int(time.time()) - 60})
+        session = {
+            "pid": 1234,
+            "command": "codex",
+            "ancestor": False,
+            "start_time": 1,
+        }
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {
+                "ACCX_HOME": str(Path(temp) / "vault"),
+                "CODEX_HOME": str(Path(temp) / "live-codex"),
+            },
+        ):
+            profile_dir = Path(temp) / "vault" / "codex" / "work"
+            profile_dir.mkdir(parents=True)
+            credential = {"tokens": {"access_token": expired, "refresh_token": "refresh"}}
+            (profile_dir / "credential.json").write_text(json.dumps(credential))
+            live = Path(temp) / "live-codex" / "auth.json"
+            live.parent.mkdir(parents=True)
+            live.write_text(json.dumps(credential))
+
+            values = ACCX["usage_cache_values"]
+            refresh = Mock()
+            with patch.dict(
+                values.__globals__,
+                {
+                    "find_active_sessions": Mock(return_value=[session]),
+                    "refresh_codex_credential": refresh,
+                    "fetch_usage": Mock(return_value={"rate_limit": {}}),
+                },
+            ):
+                values(ACCX["Provider"]("codex"), "work", True, credential, active=True)
+
+            refresh.assert_not_called()
+            self.assertEqual(json.loads(live.read_text()), credential)
+
+    def test_kill_active_flag_is_parsed_before_add_login_args(self):
+        parser = ACCX["build_parser"]()
+        switch_args = parser.parse_args(["claude", "switch", "work", "--kill-active"])
+        add_args = parser.parse_args(
+            ["claude", "add", "--kill-active", "personal", "--email", "me@example.com"]
+        )
+
+        self.assertTrue(switch_args.kill_active)
+        self.assertTrue(add_args.kill_active)
+        self.assertEqual(add_args.login_args, ["--email", "me@example.com"])
+
+
 class DashboardHttpTests(unittest.TestCase):
     def test_disconnected_client_does_not_raise_while_sending(self):
         handler = object.__new__(ACCX["DashboardHandler"])
@@ -446,6 +648,7 @@ class DashboardHttpTests(unittest.TestCase):
 
         Handler.state = state
         Handler.asset_root = Path(__file__).parents[1] / "web"
+        Handler.bind_host = "127.0.0.1"
         self.state = state
         self.server = ACCX["ThreadingHTTPServer"](("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -510,6 +713,42 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertEqual(data["dashboard"]["profiles"][0]["wake"]["prompt"], "Say hello")
         saved = json.loads((Path(self.temp.name) / "claude" / "work" / "settings.json").read_text())
         self.assertEqual(saved["wake"]["time"], "08:15")
+
+    def test_switch_conflict_returns_active_sessions(self):
+        session = {
+            "pid": 1234,
+            "command": "claude",
+            "ancestor": False,
+            "start_time": 1,
+        }
+        switch = ACCX["perform_switch_profile"]
+        with patch.dict(
+            switch.__globals__, {"find_active_sessions": Mock(return_value=[session])}
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                self.request(
+                    "/api/profiles/claude/work/switch",
+                    method="POST",
+                    data={},
+                    token=self.state.token,
+                )
+            self.assertEqual(denied.exception.code, 409)
+            payload = json.load(denied.exception)
+
+        self.assertEqual(payload["active_sessions"][0]["pid"], 1234)
+        self.assertTrue(payload["can_kill"])
+
+    def test_mutation_allowed_for_lan_host_when_bound_to_all(self):
+        handler = object.__new__(ACCX["DashboardHandler"])
+        handler.bind_host = "0.0.0.0"
+        handler.state = Mock(token="secret")
+        handler.headers = {
+            "Host": "192.168.1.10:8765",
+            "X-ACCX-Token": "secret",
+            "Content-Type": "application/json",
+        }
+
+        self.assertTrue(handler.mutation_allowed())
 
 
 if __name__ == "__main__":

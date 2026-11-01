@@ -34,7 +34,11 @@ async function request(path, options = {}) {
   }
   const response = await fetch(path, { ...options, headers });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(data.error || `HTTP ${response.status}`);
+    error.data = data;
+    throw error;
+  }
   return data;
 }
 
@@ -230,7 +234,7 @@ function openSwitch(provider, profile) {
   const item = findProfile(provider, profile);
   if (!item) return;
   switchTarget = { provider, profile };
-  document.getElementById('switchDescription').textContent = `${item.email || profile} hesabı ${provider === 'claude' ? 'Claude Code' : 'Codex CLI'} için aktif profil olacak. Mevcut aktif profil önce otomatik kaydedilir.`;
+  document.getElementById('switchDescription').textContent = `${item.email || profile} hesabı ${provider === 'claude' ? 'Claude Code' : 'Codex CLI'} için aktif profil olacak. Mevcut aktif profil önce otomatik kaydedilir. Açık bir CLI oturumu varsa ayrıca onay istenir.`;
   switchDialog.showModal();
 }
 
@@ -302,13 +306,30 @@ async function saveWake() {
   notify('Otomatik uyandırma kaydedildi.');
 }
 
+async function requestSwitch(provider, profile, killSessions) {
+  return request(`/api/profiles/${encodeURIComponent(provider)}/${encodeURIComponent(profile)}/switch`, {
+    method: 'POST',
+    body: JSON.stringify({ kill_sessions: killSessions })
+  });
+}
+
 async function confirmSwitch() {
   if (!switchTarget) return;
   const button = document.getElementById('confirmSwitch');
   button.disabled = true;
   try {
     const { provider, profile } = switchTarget;
-    const result = await request(`/api/profiles/${encodeURIComponent(provider)}/${encodeURIComponent(profile)}/switch`, { method: 'POST', body: '{}' });
+    let result;
+    try {
+      result = await requestSwitch(provider, profile, false);
+    } catch (error) {
+      const sessions = error.data?.active_sessions;
+      if (!sessions?.length || error.data?.can_kill === false) throw error;
+      const listing = sessions.map(item => `PID ${item.pid}: ${item.command}`).join('\n');
+      const confirmed = window.confirm(`Açık ${provider === 'claude' ? 'Claude Code' : 'Codex CLI'} oturum(lar)ı var:\n\n${listing}\n\nBunları durdurup devam edeyim mi?`);
+      if (!confirmed) throw error;
+      result = await requestSwitch(provider, profile, true);
+    }
     dashboard = result.dashboard;
     render();
     switchDialog.close();

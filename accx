@@ -12,6 +12,7 @@ import os
 import platform
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -28,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 SCHEMA_VERSION = 2
 WEB_SCHEMA_VERSION = 1
 AUTO_REFRESH_SECONDS = 15 * 60
@@ -207,6 +208,9 @@ class Provider:
 
     def live_metadata_path(self) -> Path | None:
         if self.name == "claude":
+            cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+            if cfg:
+                return Path(cfg).expanduser() / ".claude.json"
             return Path.home() / ".claude.json"
         return None
 
@@ -411,6 +415,294 @@ def load_profile_meta(provider: Provider, profile: str) -> dict[str, Any]:
     return credential_summary(provider, cred, live=False, legacy_cfg=legacy_cfg)
 
 
+class ActiveSessionsError(RuntimeError):
+    def __init__(self, provider: Provider, sessions: list[dict[str, Any]], reason: str) -> None:
+        self.provider = provider
+        self.sessions = sessions
+        self.reason = reason
+        super().__init__(active_session_message(provider, sessions, reason))
+
+
+def active_session_message(provider: Provider, sessions: list[dict[str, Any]], reason: str) -> str:
+    label = f"{len(sessions)} active {provider.display} " + ("session" if len(sessions) == 1 else "sessions")
+    lines = [f"{label} using the same auth file:"]
+    for session in sessions:
+        suffix = " (this command is running inside it)" if session.get("ancestor") else ""
+        lines.append(f"  PID {session['pid']}: {session['command']}{suffix}")
+    if reason == "ancestor":
+        lines.append("Run accx from a separate terminal, outside the active session.")
+    elif reason == "cancelled":
+        lines.append("Operation cancelled; active sessions were left running.")
+    else:
+        lines.append("Close them first, or rerun with --kill-active (CLI) or confirm in the dashboard.")
+    return "\n".join(lines)
+
+
+def _proc_read(pid: int, name: str) -> bytes | None:
+    try:
+        return Path(f"/proc/{pid}/{name}").read_bytes()
+    except OSError:
+        return None
+
+
+def _proc_cmdline(pid: int) -> list[str]:
+    raw = _proc_read(pid, "cmdline")
+    if not raw:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.rstrip(b"\0").split(b"\0")]
+
+
+def _proc_environ(pid: int) -> dict[str, str]:
+    raw = _proc_read(pid, "environ")
+    if not raw:
+        return {}
+    env: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        key, separator, value = item.partition(b"=")
+        if separator:
+            env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return env
+
+
+def _proc_stat_fields(pid: int) -> list[str]:
+    raw = _proc_read(pid, "stat")
+    if not raw:
+        return []
+    try:
+        return raw.decode("utf-8", "replace").rsplit(")", 1)[1].split()
+    except IndexError:
+        return []
+
+
+def _proc_start_time(pid: int) -> int | None:
+    fields = _proc_stat_fields(pid)
+    try:
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _proc_state(pid: int) -> str:
+    fields = _proc_stat_fields(pid)
+    return fields[0] if fields else ""
+
+
+def _ancestor_pids() -> set[int]:
+    ancestors: set[int] = set()
+    pid = os.getpid()
+    while pid > 1:
+        fields = _proc_stat_fields(pid)
+        if len(fields) < 2:
+            break
+        try:
+            parent = int(fields[1])
+        except ValueError:
+            break
+        if parent <= 0 or parent in ancestors:
+            break
+        ancestors.add(parent)
+        pid = parent
+    return ancestors
+
+
+def _process_home(env: dict[str, str]) -> str:
+    return env.get("HOME") or str(Path.home())
+
+
+def _process_config_dir(provider: Provider, env: dict[str, str]) -> str:
+    home = _process_home(env)
+    if provider.name == "claude":
+        value = env.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude")
+    else:
+        value = env.get("CODEX_HOME") or os.path.join(home, ".codex")
+    if value == "~" or value.startswith("~/"):
+        value = home + value[1:]
+    return os.path.realpath(value)
+
+
+def _live_config_dir(provider: Provider) -> str:
+    return os.path.realpath(provider.live_credential_path().parent)
+
+
+def _is_provider_process(
+    provider: Provider,
+    args: list[str],
+    executable: str,
+    env: dict[str, str],
+) -> bool:
+    if not args:
+        return False
+    names = {os.path.basename(args[0])}
+    if executable:
+        names.add(os.path.basename(executable))
+
+    if provider.name == "claude":
+        if "claude" not in names and not any("claude-code" in arg for arg in args[:2]):
+            return False
+        if "--chrome-native-host" in args:
+            return False
+        if len(args) > 1 and args[1] == "mcp":
+            return False
+    else:
+        is_codex_script = any(arg.endswith("/codex.js") or arg.endswith("/codex") for arg in args[:2])
+        if "codex" not in names and not is_codex_script:
+            return False
+        if len(args) > 1 and args[1] in {"app-server", "app-server-daemon", "mcp", "code-mode-host"}:
+            return False
+
+    return _process_config_dir(provider, env) == _live_config_dir(provider)
+
+
+def _summarize_command(args: list[str]) -> str:
+    def shorten(value: str) -> str:
+        base = os.path.basename(value.rstrip("/"))
+        return base if len(value) > 60 and base else value
+
+    shown = " ".join(shorten(arg) for arg in args[:2])
+    if len(args) > 2:
+        shown += " ..."
+    return shown[:160]
+
+
+def find_active_sessions(provider: Provider) -> list[dict[str, Any]]:
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    ancestors = _ancestor_pids()
+    current_uid = getattr(os, "getuid", lambda: None)()
+    sessions: list[dict[str, Any]] = []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+        try:
+            if current_uid is not None and os.stat(f"/proc/{pid}").st_uid != current_uid:
+                continue
+        except OSError:
+            continue
+        if _proc_state(pid) == "Z":
+            continue
+        args = _proc_cmdline(pid)
+        if not args:
+            continue
+        executable = ""
+        try:
+            executable = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            pass
+        if not _is_provider_process(provider, args, executable, _proc_environ(pid)):
+            continue
+        sessions.append(
+            {
+                "pid": pid,
+                "command": _summarize_command(args),
+                "ancestor": pid in ancestors,
+                "start_time": _proc_start_time(pid),
+            }
+        )
+    sessions.sort(key=lambda item: item["pid"])
+    return sessions
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return _proc_state(pid) != "Z"
+
+
+def _same_process(pid: int, start_time: int | None) -> bool:
+    if start_time is None:
+        return True
+    return _proc_start_time(pid) == start_time
+
+
+def _terminate_sessions(sessions: list[dict[str, Any]]) -> None:
+    targets = {session["pid"]: session for session in sessions if not session.get("ancestor")}
+    if not targets:
+        return
+    for pid, session in targets.items():
+        if not _same_process(pid, session.get("start_time")):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(f"  Stopping PID {pid} ({session['command']})")
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            warn(f"could not stop PID {pid}: {exc}")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        alive = [
+            pid
+            for pid, session in targets.items()
+            if _process_alive(pid) and _same_process(pid, session.get("start_time"))
+        ]
+        if not alive:
+            return
+        time.sleep(0.1)
+
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    for pid, session in targets.items():
+        if _process_alive(pid) and _same_process(pid, session.get("start_time")):
+            try:
+                os.kill(pid, sigkill)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                warn(f"could not stop PID {pid}: {exc}")
+    time.sleep(0.2)
+    remaining = [
+        pid
+        for pid, session in targets.items()
+        if _process_alive(pid) and _same_process(pid, session.get("start_time"))
+    ]
+    if remaining:
+        die(f"could not stop active session(s): {', '.join(str(pid) for pid in remaining)}")
+
+
+def ensure_no_active_sessions(
+    provider: Provider,
+    action: str,
+    *,
+    kill_active: bool = False,
+    interactive: bool = False,
+) -> None:
+    sessions = find_active_sessions(provider)
+    if not sessions:
+        return
+    if any(session.get("ancestor") for session in sessions):
+        raise ActiveSessionsError(provider, sessions, "ancestor")
+    if kill_active:
+        print(f"Stopping {len(sessions)} active {provider.display} session(s) before {action}...")
+        _terminate_sessions(sessions)
+        return
+    if interactive and sys.stdin.isatty():
+        print(
+            f"{C.red}ERROR:{C.off} {len(sessions)} active {provider.display} session(s) are using the same auth file:",
+            file=sys.stderr,
+        )
+        for session in sessions:
+            print(f"  PID {session['pid']}: {session['command']}", file=sys.stderr)
+        print("  Switching while they run can be overwritten when they refresh their token.", file=sys.stderr)
+        try:
+            answer = input(f"Kill {len(sessions)} session(s) and continue? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            raise ActiveSessionsError(provider, sessions, "cancelled") from None
+        if answer.strip().lower() in {"y", "yes", "e", "evet"}:
+            _terminate_sessions(sessions)
+            return
+        raise ActiveSessionsError(provider, sessions, "cancelled")
+    raise ActiveSessionsError(provider, sessions, "refused")
+
+
 def save_profile(provider: Provider, profile: str, quiet: bool = False) -> dict[str, Any]:
     validate_profile_name(profile)
     live_path = provider.live_credential_path()
@@ -478,11 +770,13 @@ def detect_active_profile(provider: Provider) -> str | None:
     return None
 
 
-def update_claude_oauth_account(meta: dict[str, Any]) -> None:
+def update_claude_oauth_account(provider: Provider, meta: dict[str, Any]) -> None:
     oauth = ((meta.get("claude") or {}).get("oauthAccount"))
     if not isinstance(oauth, dict) or not oauth:
         return
-    cfg_path = Path.home() / ".claude.json"
+    cfg_path = provider.live_metadata_path()
+    if not cfg_path:
+        return
     cfg = read_json(cfg_path, {})
     if not isinstance(cfg, dict):
         cfg = {}
@@ -509,7 +803,14 @@ def restore_live_credential(provider: Provider, backup: Path | None) -> None:
         copy_file(saved, live_path)
 
 
-def perform_switch_profile(provider: Provider, profile: str) -> dict[str, Any]:
+def perform_switch_profile(
+    provider: Provider,
+    profile: str,
+    *,
+    check_sessions: bool = True,
+    kill_sessions: bool = False,
+    interactive: bool = False,
+) -> dict[str, Any]:
     validate_profile_name(profile)
     pdir = provider.profile_dir(profile)
     if not pdir.exists():
@@ -517,6 +818,13 @@ def perform_switch_profile(provider: Provider, profile: str) -> dict[str, Any]:
     stored_cred = provider.stored_credential_path(profile)
     if not stored_cred.exists():
         die(f"profile '{profile}' has no stored credential file")
+    if check_sessions:
+        ensure_no_active_sessions(
+            provider,
+            "switch",
+            kill_active=kill_sessions,
+            interactive=interactive,
+        )
 
     current = detect_active_profile(provider)
     if current and current != profile:
@@ -528,7 +836,7 @@ def perform_switch_profile(provider: Provider, profile: str) -> dict[str, Any]:
 
     meta = load_profile_meta(provider, profile)
     if provider.name == "claude":
-        update_claude_oauth_account(meta)
+        update_claude_oauth_account(provider, meta)
 
     cred = read_credential(provider, live_path)
     return {
@@ -540,8 +848,13 @@ def perform_switch_profile(provider: Provider, profile: str) -> dict[str, Any]:
     }
 
 
-def switch_profile(provider: Provider, profile: str) -> None:
-    result = perform_switch_profile(provider, profile)
+def switch_profile(provider: Provider, profile: str, kill_active: bool = False) -> None:
+    result = perform_switch_profile(
+        provider,
+        profile,
+        kill_sessions=kill_active,
+        interactive=True,
+    )
     current = result["previous_profile"]
     if current and current != profile:
         print(f"  {C.dim}auto-saved active profile '{current}' before switch{C.off}")
@@ -561,12 +874,13 @@ def hide_live_credential_for_login(provider: Provider, backup: Path) -> Path | N
     return hidden
 
 
-def add_profile(provider: Provider, profile: str, login_args: list[str]) -> None:
+def add_profile(provider: Provider, profile: str, login_args: list[str], kill_active: bool = False) -> None:
     validate_profile_name(profile)
     if provider.profile_dir(profile).exists():
         die(f"profile '{profile}' already exists")
     if shutil.which(provider.cli) is None:
         die(f"{provider.cli} command not found in PATH")
+    ensure_no_active_sessions(provider, "add", kill_active=kill_active, interactive=True)
 
     current = detect_active_profile(provider)
     if current:
@@ -1261,8 +1575,13 @@ def usage_cache_values(
     raw = None
     if use_api:
         if provider.name == "codex":
-            refreshed = codex_token_needs_refresh(cred) and refresh_codex_credential(cred)
-            if refreshed and active:
+            # Token rotation writes the live auth file. Do not do that while a Codex
+            # session is running: the session may write its own copy back.
+            live_conflict = active and bool(find_active_sessions(provider))
+            refreshed = False
+            if codex_token_needs_refresh(cred) and not live_conflict:
+                refreshed = refresh_codex_credential(cred)
+            if refreshed and active and not live_conflict:
                 write_json(provider.live_credential_path(), cred)
             if refreshed or active:
                 write_json(provider.stored_credential_path(profile), cred)
@@ -1524,6 +1843,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def mutation_allowed(self) -> bool:
         host = self.headers.get("Host", "").split(":", 1)[0]
         allowed_hosts = {self.bind_host, "127.0.0.1", "localhost"}
+        if self.bind_host in {"0.0.0.0", "::"}:
+            # Binding to all interfaces means the dashboard is intentionally reachable
+            # through the machine's LAN addresses; the per-process token still protects writes.
+            allowed_hosts.add(host)
         return (
             host in allowed_hosts
             and self.headers.get("X-ACCX-Token") == self.state.token
@@ -1597,7 +1920,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     if method == "POST" and parts[4] == "switch":
                         if profile not in list_profiles(provider):
                             raise ValueError(f"profile '{profile}' not found")
-                        result = perform_switch_profile(provider, profile)
+                        kill_sessions = data.get("kill_sessions", False)
+                        if not isinstance(kill_sessions, bool):
+                            raise ValueError("kill_sessions must be a boolean")
+                        result = perform_switch_profile(provider, profile, kill_sessions=kill_sessions)
                         self.send_json(200, {"result": result, "dashboard": dashboard_data()})
                         return
                     if method == "PUT" and parts[4] == "billing":
@@ -1609,6 +1935,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         self.send_json(200, {"wake": wake_public_data(wake), "dashboard": dashboard_data()})
                         return
                 self.send_json(404, {"error": "not found"})
+        except ActiveSessionsError as exc:
+            self.send_json(
+                409,
+                {
+                    "error": str(exc),
+                    "active_sessions": exc.sessions,
+                    "can_kill": not any(session.get("ancestor") for session in exc.sessions),
+                },
+            )
         except (ValueError, TypeError) as exc:
             self.send_json(400, {"error": str(exc)})
         except SystemExit:
@@ -1694,10 +2029,20 @@ def build_parser() -> argparse.ArgumentParser:
 
         add_p = commands.add_parser("add", help="add another account without logout")
         add_p.add_argument("name")
+        add_p.add_argument(
+            "--kill-active",
+            action="store_true",
+            help="stop active CLI sessions without asking",
+        )
         add_p.add_argument("login_args", nargs=argparse.REMAINDER)
 
         switch_p = commands.add_parser("switch", help="switch to a saved account")
         switch_p.add_argument("name")
+        switch_p.add_argument(
+            "--kill-active",
+            action="store_true",
+            help="stop active CLI sessions without asking",
+        )
 
         identity_p = commands.add_parser("identity", help="show active account")
         identity_p.add_argument("--api", action="store_true", help="fetch live usage")
@@ -1721,9 +2066,20 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "save":
         save_profile(provider, args.name)
     elif args.command == "add":
-        add_profile(provider, args.name, args.login_args)
+        login_args = list(args.login_args)
+        kill_active = args.kill_active
+        if "--kill-active" in login_args:
+            kill_active = True
+            login_args.remove("--kill-active")
+        try:
+            add_profile(provider, args.name, login_args, kill_active=kill_active)
+        except ActiveSessionsError as exc:
+            die(str(exc))
     elif args.command == "switch":
-        switch_profile(provider, args.name)
+        try:
+            switch_profile(provider, args.name, kill_active=args.kill_active)
+        except ActiveSessionsError as exc:
+            die(str(exc))
     elif args.command == "identity":
         print_identity(provider, args.api)
     elif args.command == "remove":

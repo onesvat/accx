@@ -45,9 +45,9 @@ accx web [--port PORT] [--bind ADDRESS] [--no-open]
 | Command | Description |
 |---------|-------------|
 | `list [--api]` | Table of saved accounts with usage percentages and reset times |
-| `add <name> [opts]` | Add a new account without logging out of the current one |
+| `add [--kill-active] <name> [opts]` | Add a new account without logging out of the current one |
 | `save <name>` | Save current account under a name |
-| `switch <name>` | Switch to a saved account |
+| `switch [--kill-active] <name>` | Switch to a saved account |
 | `identity [--api]` | Show active account details, plan type, subscription info |
 | `paths` | Show live auth paths and environment variables that may override them |
 
@@ -106,6 +106,24 @@ accx claude save personal
 
 Claude access tokens expire frequently. That is normal when a refresh token is present; Claude Code should refresh the access token on the next authenticated run.
 
+### Active sessions
+
+A running CLI process keeps its OAuth token in memory and may write it back when it refreshes. Switching the auth file underneath it can therefore be overwritten. Before `switch` and `add`, `accx` looks for running Claude Code or Codex CLI processes that use the same auth file.
+
+- In a terminal it lists the PIDs and asks before stopping them.
+- In a non-interactive shell it refuses and exits with an error.
+- `--kill-active` gives consent up front:
+
+```bash
+accx claude switch --kill-active work
+accx claude add --kill-active personal --email me@example.com
+accx codex switch --kill-active work
+```
+
+The web dashboard asks for confirmation when a switch hits an active session. Background helpers such as Claude's Chrome native host and Codex's `app-server` daemon are not treated as sessions and are never stopped.
+
+Do not run `switch` or `add` from inside the CLI session whose account you are changing: `accx` detects that it is running under that session and refuses, because stopping it would also stop `accx`.
+
 ### API mode
 
 By default `list` and `identity` use cached data. Add `--api` to fetch live usage:
@@ -125,7 +143,9 @@ accx codex identity --api   # live usage from ChatGPT API
 - `~/.claude/.credentials.json` — OAuth tokens (access + refresh)
 - `~/.claude.json` — cached identity (`oauthAccount`) + settings
 
-`accx` stores and restores only the credential file. It stores `oauthAccount` separately as metadata and updates only that field on switch, preserving unrelated Claude settings such as MCP servers, plugins, project state, and UI preferences.
+`accx` stores and restores only the credential file. It stores `oauthAccount` separately as metadata and updates only that field on switch, preserving unrelated Claude settings such as MCP servers, plugins, project state, and UI preferences. If `CLAUDE_CONFIG_DIR` is set, both files are read from that directory instead of the home directory.
+
+Background token refreshes for an active Codex profile are skipped while a Codex session is running, so `accx` does not overwrite the live `auth.json` under a running process.
 
 **Codex CLI** stores auth in one file:
 - `~/.codex/auth.json`

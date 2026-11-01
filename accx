@@ -29,11 +29,14 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 SCHEMA_VERSION = 2
 WEB_SCHEMA_VERSION = 1
 AUTO_REFRESH_SECONDS = 15 * 60
 WAKE_CHECK_SECONDS = 15
+NOTIFY_GRACE_SECONDS = 60 * 60
+NOTIFY_MIN_USAGE = 99.0
+NOTIFY_STATE_SCHEMA = 1
 WAKE_LOG_LOCK = threading.Lock()
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -73,6 +76,25 @@ def wake_log(event: str, **details: Any) -> None:
             os.chmod(path, 0o600)
     except (OSError, TypeError, ValueError) as exc:
         print(f"Auto wake log write failed: {exc}", file=sys.stderr)
+
+
+def desktop_notify(title: str, body: str, urgency: str = "normal") -> bool:
+    if os.environ.get("ACCX_DESKTOP_NOTIFY", "").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    command = shutil.which("notify-send")
+    if not command:
+        return False
+    try:
+        subprocess.run(
+            [command, "-a", "accx", "-u", urgency, "-t", "10000", title, body],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def die(message: str, code: int = 1) -> None:
@@ -1200,6 +1222,134 @@ def load_usage_cache(provider: Provider, profile: str) -> tuple[dict[str, Any] |
     return cache["raw"], cache.get("fetched_at")
 
 
+def notify_state_path() -> Path:
+    return accx_home() / "notify-state.json"
+
+
+def load_notify_state() -> dict[str, Any]:
+    state = read_json(notify_state_path(), {}, strict=False)
+    if not isinstance(state, dict):
+        state = {}
+    sent = state.get("sent")
+    if not isinstance(sent, dict):
+        sent = {}
+    pending = state.get("pending")
+    if not isinstance(pending, dict):
+        pending = {}
+    return {"schema": NOTIFY_STATE_SCHEMA, "sent": sent, "pending": pending}
+
+
+def process_due_notifications(now: datetime | None = None) -> list[dict[str, Any]]:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    state = load_notify_state()
+    sent = state["sent"]
+    pending = state["pending"]
+    changed = False
+    results: list[dict[str, Any]] = []
+
+    for provider_name in ("claude", "codex"):
+        provider = Provider(provider_name)
+        for profile in list_profiles(provider):
+            raw, fetched_at = load_usage_cache(provider, profile)
+            if not raw:
+                continue
+            snapshot = usage_snapshot(provider, raw, recorded_at=fetched_at)
+            for label, usage_key, reset_key in (
+                ("5 saatlik limit", "five_hour", "five_hour_resets_at"),
+                ("7 günlük limit", "seven_day", "seven_day_resets_at"),
+            ):
+                reset_value = snapshot.get(reset_key)
+                reset = parse_iso_datetime(reset_value)
+                if reset is None:
+                    continue
+                reset = reset.astimezone(timezone.utc)
+                sent_key = f"{provider.name}:{profile}:{reset_key}:{reset.isoformat()}"
+                if sent_key in sent:
+                    continue
+                for pending_key, item in list(pending.items()):
+                    if (
+                        item.get("provider") == provider.name
+                        and item.get("profile") == profile
+                        and item.get("window") == usage_key
+                        and pending_key != sent_key
+                    ):
+                        old_reset = parse_iso_datetime(item.get("reset_at"))
+                        if old_reset and old_reset.astimezone(timezone.utc) > current:
+                            del pending[pending_key]
+                            changed = True
+                try:
+                    usage = float(snapshot.get(usage_key))
+                except (TypeError, ValueError):
+                    usage = None
+                if usage is not None and usage >= NOTIFY_MIN_USAGE:
+                    if sent_key not in pending:
+                        pending[sent_key] = {
+                            "provider": provider.name,
+                            "profile": profile,
+                            "window": usage_key,
+                            "label": label,
+                            "reset_at": reset.isoformat(),
+                        }
+                        changed = True
+
+    for pending_key, item in list(pending.items()):
+        reset = parse_iso_datetime(item.get("reset_at"))
+        if reset is None:
+            del pending[pending_key]
+            changed = True
+            continue
+        reset = reset.astimezone(timezone.utc)
+        if reset > current:
+            continue
+        if pending_key in sent:
+            del pending[pending_key]
+            changed = True
+            continue
+        age = (current - reset).total_seconds()
+        if age <= NOTIFY_GRACE_SECONDS:
+            provider = Provider(str(item.get("provider") or "claude"))
+            label = str(item.get("label") or item.get("window") or "limit")
+            body = f"{item.get('profile')} · {format_reset_time(reset.isoformat(), now=current)}"
+            if desktop_notify(f"{provider.display}: {label} sıfırlandı", body):
+                wake_log(
+                    "desktop_notified",
+                    provider=provider.name,
+                    profile=item.get("profile"),
+                    window=item.get("window"),
+                    reset_at=reset.isoformat(),
+                )
+                results.append(
+                    {
+                        "provider": provider.name,
+                        "profile": item.get("profile"),
+                        "window": item.get("window"),
+                        "reset_at": reset.isoformat(),
+                    }
+                )
+        sent[pending_key] = now_iso()
+        del pending[pending_key]
+        changed = True
+
+    cutoff = current - timedelta(days=45)
+    for key, timestamp in list(sent.items()):
+        parsed = parse_iso_datetime(timestamp)
+        if parsed and parsed.astimezone(timezone.utc) < cutoff:
+            del sent[key]
+            changed = True
+    for key, item in list(pending.items()):
+        parsed = parse_iso_datetime(item.get("reset_at"))
+        if parsed and parsed.astimezone(timezone.utc) < cutoff:
+            del pending[key]
+            changed = True
+    if changed:
+        state["schema"] = NOTIFY_STATE_SCHEMA
+        write_json(notify_state_path(), state)
+    return results
+
+
 def renewal_for_month(year: int, month: int, anchor_day: int):
     return datetime(year, month, min(anchor_day, calendar.monthrange(year, month)[1])).date()
 
@@ -1418,10 +1568,21 @@ def wake_command(provider: Provider, prompt: str) -> list[str]:
     ]
 
 
-def start_wake(provider: Provider, profile: str, wake: dict[str, Any]) -> str:
+def start_wake(
+    provider: Provider,
+    profile: str,
+    wake: dict[str, Any],
+    notify: bool = True,
+) -> str:
     if shutil.which(provider.cli) is None:
         result = f"failed: {provider.cli} command not found"
         wake_log("wake_failed", provider=provider.name, profile=profile, error=result)
+        if notify:
+            desktop_notify(
+                "accx: uyandırma başarısız",
+                f"{provider.display} · {profile}\n{result}",
+                urgency="critical",
+            )
         return result
     runtime_dir = provider.profile_dir(profile) / ".wake-runtime"
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -1449,6 +1610,12 @@ def start_wake(provider: Provider, profile: str, wake: dict[str, Any]) -> str:
     except OSError as exc:
         result = f"failed: {exc}"
         wake_log("wake_failed", provider=provider.name, profile=profile, error=result)
+        if notify:
+            desktop_notify(
+                "accx: uyandırma başarısız",
+                f"{provider.display} · {profile}\n{exc}",
+                urgency="critical",
+            )
         return result
     wake_log(
         "wake_started",
@@ -1468,6 +1635,18 @@ def start_wake(provider: Provider, profile: str, wake: dict[str, Any]) -> str:
             exit_code=exit_code,
             output=str(output_path),
         )
+        if notify:
+            if exit_code == 0:
+                desktop_notify(
+                    "accx: uyandırma tamamlandı",
+                    f"{provider.display} · {profile}",
+                )
+            else:
+                desktop_notify(
+                    "accx: uyandırma başarısız",
+                    f"{provider.display} · {profile} (çıkış {exit_code})",
+                    urgency="critical",
+                )
 
     if isinstance(process.pid, int):
         threading.Thread(target=record_completion, name=f"accx-wake-{process.pid}", daemon=True).start()
@@ -1977,21 +2156,42 @@ def run_web_dashboard(port: int, bind: str = "127.0.0.1", open_browser: bool = T
         threading.Timer(0.2, lambda: webbrowser.open(url)).start()
     scheduler_stop = threading.Event()
     wake_log("scheduler_started", check_interval_seconds=WAKE_CHECK_SECONDS)
+    try:
+        with state.lock:
+            process_due_notifications()
+    except Exception as exc:
+        wake_log("notification_seed_failed", error=str(exc), traceback=traceback.format_exc())
 
     def run_scheduler() -> None:
         while not scheduler_stop.is_set():
             try:
                 with state.lock:
                     results = process_due_wakes()
+                    notifications = process_due_notifications()
                 for result in results:
                     print(f"Auto wake {result['provider']}/{result['profile']}: {result['result']}")
+                for item in notifications:
+                    print(
+                        f"Desktop notification {item['provider']}/{item['profile']}: "
+                        f"{item['window']} reset"
+                    )
             except Exception as exc:
                 wake_log("scheduler_check_failed", error=str(exc), traceback=traceback.format_exc())
                 print(f"Auto wake check failed: {exc}", file=sys.stderr)
             scheduler_stop.wait(WAKE_CHECK_SECONDS)
 
+    def run_usage_refresh() -> None:
+        while not scheduler_stop.is_set():
+            try:
+                refresh_dashboard_usage(force=False)
+            except Exception as exc:
+                wake_log("usage_refresh_failed", error=str(exc), traceback=traceback.format_exc())
+            scheduler_stop.wait(AUTO_REFRESH_SECONDS)
+
     scheduler = threading.Thread(target=run_scheduler, name="accx-wake-scheduler", daemon=True)
+    usage_thread = threading.Thread(target=run_usage_refresh, name="accx-usage-refresh", daemon=True)
     scheduler.start()
+    usage_thread.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1999,6 +2199,7 @@ def run_web_dashboard(port: int, bind: str = "127.0.0.1", open_browser: bool = T
     finally:
         scheduler_stop.set()
         scheduler.join(timeout=2)
+        usage_thread.join(timeout=2)
         wake_log("scheduler_stopped")
         server.server_close()
 

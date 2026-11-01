@@ -373,7 +373,10 @@ class DashboardDataTests(unittest.TestCase):
             (profile_dir / "credential.json").write_text('{"tokens":{"access_token":"secret"}}')
             with patch("shutil.which", return_value="/usr/bin/codex"), patch("subprocess.Popen") as popen:
                 result = ACCX["start_wake"](
-                    ACCX["Provider"]("codex"), "work", {"prompt": "ping"}
+                    ACCX["Provider"]("codex"),
+                    "work",
+                    {"prompt": "ping"},
+                    notify=False,
                 )
 
             runtime = profile_dir / ".wake-runtime"
@@ -608,6 +611,141 @@ class SessionGuardTests(unittest.TestCase):
         self.assertTrue(switch_args.kill_active)
         self.assertTrue(add_args.kill_active)
         self.assertEqual(add_args.login_args, ["--email", "me@example.com"])
+
+
+class DesktopNotificationTests(unittest.TestCase):
+    def test_desktop_notify_uses_notify_send(self):
+        with patch("shutil.which", return_value="/usr/bin/notify-send"), patch(
+            "subprocess.run"
+        ) as run, patch.dict(os.environ, {"ACCX_DESKTOP_NOTIFY": "1"}):
+            self.assertTrue(ACCX["desktop_notify"]("Başlık", "Gövde"))
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "/usr/bin/notify-send")
+        self.assertIn("-a", command)
+        self.assertIn("accx", command)
+        self.assertEqual(command[-2:], ["Başlık", "Gövde"])
+
+    def test_desktop_notify_can_be_disabled(self):
+        with patch("shutil.which", return_value="/usr/bin/notify-send"), patch(
+            "subprocess.run"
+        ) as run, patch.dict(os.environ, {"ACCX_DESKTOP_NOTIFY": "0"}):
+            self.assertFalse(ACCX["desktop_notify"]("Başlık", "Gövde"))
+
+        run.assert_not_called()
+
+    def test_full_limit_reset_sends_one_desktop_notification(self):
+        now = datetime(2026, 11, 1, 16, 0, tzinfo=timezone.utc)
+        reset = now - timedelta(minutes=5)
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"ACCX_HOME": temp}
+        ):
+            profile_dir = Path(temp) / "claude" / "work"
+            profile_dir.mkdir(parents=True)
+            (profile_dir / ".usage-cache.json").write_text(
+                json.dumps(
+                    {
+                        "fetched_at": now.isoformat(),
+                        "raw": {
+                            "five_hour": {
+                                "utilization": 100,
+                                "resets_at": reset.isoformat(),
+                            },
+                            "seven_day": {
+                                "utilization": 50,
+                                "resets_at": reset.isoformat(),
+                            },
+                        },
+                    }
+                )
+            )
+            notify = Mock(return_value=True)
+            process = ACCX["process_due_notifications"]
+            with patch.dict(process.__globals__, {"desktop_notify": notify}):
+                first = process(now=now)
+                second = process(now=now)
+
+            self.assertEqual(len(first), 1)
+            self.assertEqual(second, [])
+            self.assertEqual(notify.call_count, 1)
+            self.assertIn("5 saatlik", notify.call_args.args[0])
+            state = json.loads((Path(temp) / "notify-state.json").read_text())
+            self.assertEqual(len(state["sent"]), 1)
+            self.assertEqual(state["pending"], {})
+
+    def test_pending_reset_survives_cache_refresh(self):
+        now = datetime(2026, 11, 1, 16, 0, tzinfo=timezone.utc)
+        old_reset = now + timedelta(minutes=5)
+        new_reset = now + timedelta(hours=5)
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"ACCX_HOME": temp}
+        ):
+            profile_dir = Path(temp) / "claude" / "work"
+            profile_dir.mkdir(parents=True)
+            cache = profile_dir / ".usage-cache.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "raw": {
+                            "five_hour": {
+                                "utilization": 100,
+                                "resets_at": old_reset.isoformat(),
+                            }
+                        }
+                    }
+                )
+            )
+            notify = Mock(return_value=True)
+            process = ACCX["process_due_notifications"]
+            with patch.dict(process.__globals__, {"desktop_notify": notify}):
+                before = process(now=now)
+                self.assertEqual(before, [])
+                self.assertEqual(notify.call_count, 0)
+
+                cache.write_text(
+                    json.dumps(
+                        {
+                            "raw": {
+                                "five_hour": {
+                                    "utilization": 0,
+                                    "resets_at": new_reset.isoformat(),
+                                }
+                            }
+                        }
+                    )
+                )
+                after = process(now=old_reset + timedelta(minutes=1))
+
+            self.assertEqual(len(after), 1)
+            self.assertEqual(notify.call_count, 1)
+
+    def test_old_reset_is_ignored_without_notification(self):
+        now = datetime(2026, 11, 1, 16, 0, tzinfo=timezone.utc)
+        reset = now - timedelta(hours=2)
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ, {"ACCX_HOME": temp}
+        ):
+            profile_dir = Path(temp) / "claude" / "work"
+            profile_dir.mkdir(parents=True)
+            (profile_dir / ".usage-cache.json").write_text(
+                json.dumps(
+                    {
+                        "raw": {
+                            "five_hour": {
+                                "utilization": 100,
+                                "resets_at": reset.isoformat(),
+                            }
+                        }
+                    }
+                )
+            )
+            notify = Mock(return_value=True)
+            process = ACCX["process_due_notifications"]
+            with patch.dict(process.__globals__, {"desktop_notify": notify}):
+                results = process(now=now)
+
+            self.assertEqual(results, [])
+            notify.assert_not_called()
 
 
 class DashboardHttpTests(unittest.TestCase):

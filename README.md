@@ -124,6 +124,15 @@ The web dashboard asks for confirmation when a switch hits an active session. Ba
 
 Do not run `switch` or `add` from inside the CLI session whose account you are changing: `accx` detects that it is running under that session and refuses, because stopping it would also stop `accx`.
 
+### Desktop notifications
+
+While `accx web` is running, `accx` sends Linux desktop notifications through `notify-send` when:
+
+- a 5-hour or 7-day window that reached at least 99% resets,
+- a scheduled wake completes or fails.
+
+Notifications are deduplicated in `~/.accx/notify-state.json`. Set `ACCX_DESKTOP_NOTIFY=0` to disable them. The server refreshes usage every 15 minutes even when the browser is closed, so reset times stay current. If `notify-send` is not installed, notifications are skipped silently.
+
 ### API mode
 
 By default `list` and `identity` use cached data. Add `--api` to fetch live usage:

@@ -16,6 +16,7 @@ Every response has `version`, `id`, and exactly one of `result` or `error`. An e
 | `wake.save` | `provider`, `profile_id`, `wake` | `status: "saved"` |
 | `wake.now` | `provider`, `profile_id`; uses the saved prompt | `status: "started"` |
 | `switch` | `provider`, `profile_id` | `status: "switched"` |
+| `runtime.prepare` | `provider`, `profile_id` | `path`, `status: "ready"` |
 
 Providers are `claude` and `codex`. A profile ID stays stable while its local name and provider stay the same. The display `label` can be an alias when the name is unsuitable for display. For login and profile creation, list local names with `accx claude list` or `accx codex list` and use the provider's existing accx CLI commands. OpenCode remains available via its CLI and the local web panel.
 
@@ -26,3 +27,7 @@ Billing takes `amount` (decimal string), `currency`, `renewal_date` (YYYY-MM-DD)
 Request errors include `invalid_request`, `request_too_large`, `unsupported_version`, `unknown_method`, `invalid_params`, and `profile_not_found`. Operation errors include `active_sessions`, `configuration_conflict`, `login_needed`, `wake_not_configured`, `wake_running`, `wake_failed`, and `operation_failed`. If the child dies after accepting a mutation, or returns `operation_failed`, reconcile the result without repeating the mutation. A wake launch can report `unknown` if the owning process stops before recording the exit.
 
 Updated web and machine processes in the same store elect one wake scheduler using an OS file lock. The scheduler skips occurrences before ownership or during a long pause. It records an occurrence before launching it. Both processes may check usage every 15 minutes, with a shared lock and per-profile attempt timestamps preventing duplicate automatic refreshes. The installed web service must pick up this code before running both processes on one store.
+
+`runtime.prepare` returns `path`, `status: "ready"` and `shared`. For a profile that is not the terminal's active one it creates or refreshes the profile's single persistent runtime directory (`<store>/<provider>/<profile>/.agent-runtime`) and returns its path; the caller points `CLAUDE_CONFIG_DIR` (Claude) or `CODEX_HOME` (Codex) at it. Wake uses the same directory (only its state and log stay in `.wake-runtime`). For the terminal's active profile it makes no copy and answers `path: null, shared: true`: the job must leave the config directory variable unset and share the terminal's config, because a second copy could rotate the refresh token and log the terminal out.
+
+All copies are reconciled under the store lock shared with refresh and switch: the copy with the latest access expiry among live (active profile only), stored and runtime wins, and older copies are updated, never the reverse. `switch` first reconciles the target profile (its runtime copy may be newer than the stored one) and the profile being switched away from; automatic saves before a switch or login never replace a newer stored or runtime credential. Only an explicit `accx <provider> save` overwrites with the live file. Errors: `profile_not_found`, `login_needed`.

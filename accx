@@ -817,7 +817,7 @@ def ensure_no_active_sessions(
 
 
 @store_operation
-def save_profile(provider: Provider, profile: str, quiet: bool = False) -> dict[str, Any]:
+def save_profile(provider: Provider, profile: str, quiet: bool = False, newest_only: bool = False) -> dict[str, Any]:
     validate_profile_name(profile)
     live_path = provider.live_credential_path()
     if provider.name == "claude" and platform.system() == "Darwin" and not live_path.exists():
@@ -830,6 +830,9 @@ def save_profile(provider: Provider, profile: str, quiet: bool = False) -> dict[
     pdir.mkdir(parents=True, exist_ok=True)
     if provider.name == "opencode":
         write_json(pdir / "credential.json", cred)
+    elif newest_only:
+        # Automatic saves (before a switch or login) must not replace a newer stored or runtime credential.
+        reconcile_profile(provider, profile, include_live=True)
     else:
         copy_file(live_path, pdir / "credential.json")
     meta = credential_summary(provider, cred, live=True)
@@ -976,7 +979,9 @@ def perform_switch_profile(
 
     current = detect_active_profile(provider)
     if current and current != profile:
-        save_profile(provider, current, quiet=True)
+        save_profile(provider, current, quiet=True, newest_only=True)
+    if provider.name != "opencode":
+        reconcile_profile(provider, profile)  # the target's runtime copy may hold a newer token than its stored one
 
     backup_live_credential(provider, "switch")
     live_path = provider.live_credential_path()
@@ -1047,7 +1052,7 @@ def add_profile(provider: Provider, profile: str, login_args: list[str], kill_ac
 
     current = detect_active_profile(provider)
     if current:
-        save_profile(provider, current, quiet=True)
+        save_profile(provider, current, quiet=True, newest_only=True)
         print(f"  {C.dim}saved active profile '{current}' before login{C.off}")
     else:
         print(f"  {C.dim}active {provider.name} account is not a saved profile; keeping a backup before login{C.off}")
@@ -1773,6 +1778,71 @@ def save_wake(provider: Provider, profile: str, data: dict[str, Any]) -> dict[st
     return wake
 
 
+def credential_expiry_or_zero(provider: Provider, path: Path) -> int:
+    try:
+        return credential_access_expiry_ms(provider, read_credential(provider, path)) or 0
+    except (SystemExit, ValueError, OSError):
+        return 0
+
+
+def runtime_credential_name(provider: Provider) -> str:
+    return ".credentials.json" if provider.name == "claude" else "auth.json"
+
+
+def agent_runtime_dir(provider: Provider, profile: str) -> Path:
+    return provider.profile_dir(profile) / ".agent-runtime"
+
+
+@store_operation
+def reconcile_profile(provider: Provider, profile: str, include_live: bool = False, create_runtime: bool = False) -> Path:
+    """Bring every copy of a profile's credential up to the newest one and return that copy.
+
+    Refresh tokens may rotate, so the terminal's live file (only when include_live),
+    the stored copy and the agent runtime copy must never regress to an older
+    one. The copy with the latest access expiry wins (ties keep the first of
+    live, stored, runtime). Existing copies and the stored copy are updated;
+    the runtime copy is created only with create_runtime. Runs under the store
+    lock shared with refresh and switch.
+    """
+    live = provider.live_credential_path()
+    stored = provider.stored_credential_path(profile)
+    runtime = agent_runtime_dir(provider, profile) / runtime_credential_name(provider)
+    stored_target = provider.profile_dir(profile) / "credential.json"
+    candidates = [path for path in ([live] if include_live else []) + [stored, runtime] if path.exists()]
+    if not candidates:
+        die(f"profile '{profile}' has no credential to reconcile")
+    newest = max(candidates, key=lambda path: credential_expiry_or_zero(provider, path))
+    # max() keeps the first of equal values, which is the priority order above.
+    targets = {stored if stored.exists() else stored_target, *candidates}
+    if create_runtime:
+        targets.add(runtime)
+    for target in targets - {newest}:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700) if target == runtime else None
+        copy_file(newest, target)
+    return newest
+
+
+@store_operation
+def prepare_agent_runtime(provider: Provider, profile: str) -> Path | None:
+    """The runtime directory for an agent job or wake, or None when the job must share the terminal's config.
+
+    The terminal's active profile is never copied: a second copy could rotate
+    the refresh token and log the terminal out. Other profiles get one
+    persistent runtime directory, shared by wake and agent jobs.
+    """
+    live = provider.live_credential_path()
+    if live.exists() and is_active(provider, profile):
+        return None
+    runtime_dir = agent_runtime_dir(provider, profile)
+    runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    reconcile_profile(provider, profile, create_runtime=True)
+    if provider.name == "codex":
+        source_config = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "config.toml"
+        if source_config.exists():
+            copy_file(source_config, runtime_dir / "config.toml")
+    return runtime_dir
+
+
 def wake_command(provider: Provider, prompt: str) -> list[str]:
     if provider.name == "claude":
         return ["claude", "-p", "--model", "haiku", "--", prompt]
@@ -1830,24 +1900,23 @@ def start_wake(
                 urgency="critical",
             )
         return result
-    runtime_dir = provider.profile_dir(profile) / ".wake-runtime"
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    state_path = runtime_dir / "state.json"
+    state_dir = provider.profile_dir(profile) / ".wake-runtime"  # state and log only; credentials live in the shared runtime
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / "state.json"
     if wake_is_running(wake_runtime_state(provider, profile)):
         return "already_running"
-    output_path = runtime_dir / "wake.log"
-    credential_name = ".credentials.json" if provider.name == "claude" else "auth.json"
-    copy_file(provider.stored_credential_path(profile), runtime_dir / credential_name)
+    output_path = state_dir / "wake.log"
     env = os.environ.copy()
     for name in env_overrides(provider):
         env.pop(name, None)
-    if provider.name == "claude":
-        env["CLAUDE_CONFIG_DIR"] = str(runtime_dir)
-    else:
-        source_config = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "config.toml"
-        if source_config.exists():
-            copy_file(source_config, runtime_dir / "config.toml")
-        env["CODEX_HOME"] = str(runtime_dir)
+    try:
+        shared_dir = prepare_agent_runtime(provider, profile)
+    except (SystemExit, OSError) as exc:
+        result = f"failed: {exc}"
+        wake_log("wake_failed", provider=provider.name, profile=profile, error=result)
+        return result
+    if shared_dir is not None:
+        env["CLAUDE_CONFIG_DIR" if provider.name == "claude" else "CODEX_HOME"] = str(shared_dir)
     try:
         with output_path.open("ab") as output:
             process = subprocess.Popen(
@@ -2695,7 +2764,7 @@ def machine_dispatch(method: str, params: dict[str, Any]) -> dict[str, Any]:
 
 @store_operation
 def machine_mutation(method: str, params: dict[str, Any]) -> dict[str, Any]:
-    if method not in {"billing.save", "wake.save", "wake.now", "switch"}:
+    if method not in {"billing.save", "wake.save", "wake.now", "switch", "runtime.prepare"}:
         raise MachineError("unknown_method")
     payload_key = {"billing.save": "billing", "wake.save": "wake"}.get(method)
     keys = {"provider", "profile_id"}
@@ -2714,6 +2783,15 @@ def machine_mutation(method: str, params: dict[str, Any]) -> dict[str, Any]:
             machine_params(data, {"enabled", "recurrence", "date", "time", "prompt"})
             save_wake(provider, profile, data)
         return {"status": "saved"}
+    if method == "runtime.prepare":
+        try:
+            cred = profile_credential(provider, profile)
+        except SystemExit:
+            raise MachineError("login_needed") from None
+        if machine_login_needed(provider, cred):
+            raise MachineError("login_needed")
+        path = prepare_agent_runtime(provider, profile)
+        return {"path": str(path) if path else None, "status": "ready", "shared": path is None}
     if method == "wake.now":
         wake = load_wake(provider, profile)
         if not wake:

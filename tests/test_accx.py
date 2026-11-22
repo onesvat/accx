@@ -403,7 +403,7 @@ class DashboardDataTests(unittest.TestCase):
         )
 
     def test_wake_uses_isolated_profile_credentials(self):
-        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"ACCX_HOME": temp}):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"ACCX_HOME": temp, "CODEX_HOME": str(Path(temp) / "live")}):
             profile_dir = Path(temp) / "codex" / "work"
             profile_dir.mkdir(parents=True)
             (profile_dir / "credential.json").write_text('{"tokens":{"access_token":"secret"}}')
@@ -415,9 +415,10 @@ class DashboardDataTests(unittest.TestCase):
                     notify=False,
                 )
 
-            runtime = profile_dir / ".wake-runtime"
+            runtime = profile_dir / ".agent-runtime"
             self.assertEqual(result, "started")
             self.assertTrue((runtime / "auth.json").exists())
+            self.assertFalse((profile_dir / ".wake-runtime" / "auth.json").exists())
             self.assertEqual(popen.call_args.kwargs["env"]["CODEX_HOME"], str(runtime))
             self.assertEqual(popen.call_args.kwargs["stderr"], ACCX["subprocess"].STDOUT)
             events = [json.loads(line) for line in (Path(temp) / "wake.log").read_text().splitlines()]

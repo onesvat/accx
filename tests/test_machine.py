@@ -172,3 +172,111 @@ class MachineTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         state = ACCX["wake_runtime_state"](self.provider, "work")
         self.assertEqual(state["last_result"], "succeeded")
+
+    def credential(self, access, expires, refresh="secret-refresh"):
+        return json.dumps({"claudeAiOauth": {"accessToken": access, "refreshToken": refresh, "expiresAt": expires}})
+
+    def test_runtime_prepare_returns_only_a_path_and_keeps_newer_credentials(self):
+        stored = self.path / "credential.json"
+        stored.write_text(self.credential("stored-access", 1000))
+        response = self.call("runtime.prepare", self.target)
+        self.assertEqual(response["result"]["status"], "ready")
+        runtime = Path(response["result"]["path"])
+        self.assertEqual(runtime, self.path / ".agent-runtime")
+        self.assertEqual(set(response["result"]), {"path", "status", "shared"})
+        self.assertFalse(response["result"]["shared"])
+        self.assertNotIn("secret-", json.dumps(response))
+        self.assertEqual(oct((runtime / ".credentials.json").stat().st_mode & 0o777), "0o600")
+        self.assertIn("stored-access", (runtime / ".credentials.json").read_text())
+
+        # The agent refreshed its copy: a second prepare keeps it and carries it back to the store.
+        (runtime / ".credentials.json").write_text(self.credential("runtime-access", 5000, "rotated"))
+        self.assertEqual(self.call("runtime.prepare", self.target)["result"]["path"], str(runtime))
+        self.assertIn("runtime-access", (runtime / ".credentials.json").read_text())
+        self.assertIn("runtime-access", stored.read_text())
+
+        # A newer stored credential replaces an older runtime copy.
+        stored.write_text(self.credential("fresh-access", 9000))
+        self.call("runtime.prepare", self.target)
+        self.assertIn("fresh-access", (runtime / ".credentials.json").read_text())
+
+    def test_runtime_prepare_errors_and_shared_store_lock(self):
+        self.assertEqual(self.call("runtime.prepare", {"provider": "claude", "profile_id": "nope"})["error"],
+                         {"code": "profile_not_found"})
+        self.assertEqual(self.call("runtime.prepare", self.target | {"extra": 1})["error"], {"code": "invalid_params"})
+        (self.path / "credential.json").write_text(json.dumps({}))
+        self.assertEqual(self.call("runtime.prepare", self.target)["error"], {"code": "login_needed"})
+        self.assertFalse((self.path / ".agent-runtime").exists())
+        # prepare takes the same store lock that refresh and switch use.
+        (self.path / "credential.json").write_text(self.credential("a", 1000))
+        entered = []
+        original = MODULE["file_lock"]
+
+        def spy(name, blocking=True):
+            entered.append(name)
+            return original(name, blocking)
+
+        with patch.dict(MODULE, {"file_lock": spy}):
+            self.call("runtime.prepare", self.target)
+        self.assertIn(".store.lock", entered)
+
+    def live_path(self):
+        return Path(self.temp) / "claude" / ".credentials.json"
+
+    def test_active_profile_is_shared_and_never_copied(self):
+        (self.path / "credential.json").write_text(self.credential("a", 1000))
+        self.live_path().parent.mkdir(parents=True)
+        self.live_path().write_text(self.credential("live", 2000))
+        with patch.dict(MODULE, {"is_active": Mock(return_value=True)}):
+            result = self.call("runtime.prepare", self.target)["result"]
+        self.assertEqual(result, {"path": None, "status": "ready", "shared": True})
+        self.assertFalse((self.path / ".agent-runtime").exists())
+
+    def test_wake_and_agent_jobs_use_one_runtime_directory(self):
+        (self.path / "credential.json").write_text(self.credential("a", 1000))
+        runtime = Path(self.call("runtime.prepare", self.target)["result"]["path"])
+        with patch("shutil.which", return_value="/bin/claude"), patch("subprocess.Popen", return_value=Mock(pid=0)) as popen:
+            self.assertEqual(ACCX["start_wake"](self.provider, "work", {"prompt": "x"}, notify=False), "started")
+        self.assertEqual(popen.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(runtime))
+        self.assertFalse((self.path / ".wake-runtime" / ".credentials.json").exists())
+        # On the active profile the wake shares the terminal's config: no directory is pinned and no copy made.
+        import shutil
+        shutil.rmtree(runtime)
+        self.live_path().parent.mkdir(parents=True)
+        self.live_path().write_text(self.credential("live", 2000))
+        with patch.dict(MODULE, {"is_active": Mock(return_value=True)}), patch("shutil.which", return_value="/bin/claude"), \
+                patch("subprocess.Popen", return_value=Mock(pid=0)) as popen:
+            ACCX["start_wake"](self.provider, "work", {"prompt": "x"}, notify=False)
+        self.assertEqual(popen.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(self.live_path().parent))
+        self.assertFalse(runtime.exists())
+
+    def test_switch_and_automatic_save_keep_the_newest_credential(self):
+        home = self.provider.profile_dir("home")
+        home.mkdir(parents=True)
+        (home / "credential.json").write_text(self.credential("home-stored", 2000))
+        (home / "meta.json").write_text("{}")
+        (home / ".agent-runtime").mkdir()
+        (home / ".agent-runtime" / ".credentials.json").write_text(self.credential("home-runtime", 4000))
+        self.live_path().parent.mkdir(parents=True)
+        self.live_path().write_text(self.credential("home-live", 3000))
+        (self.path / "credential.json").write_text(self.credential("work-stored", 1000))
+        (self.path / ".agent-runtime").mkdir()
+        (self.path / ".agent-runtime" / ".credentials.json").write_text(self.credential("work-runtime", 5000))
+        with patch.dict(MODULE, {"is_active": lambda provider, name: name == "home"}):
+            ACCX["perform_switch_profile"](self.provider, "work", check_sessions=False)
+        self.assertIn("work-runtime", self.live_path().read_text())
+        self.assertIn("work-runtime", (self.path / "credential.json").read_text())
+        self.assertIn("home-runtime", (home / "credential.json").read_text())
+        self.assertIn("home-runtime", (home / ".agent-runtime" / ".credentials.json").read_text())
+
+    def test_automatic_save_does_not_regress_but_explicit_save_does_replace(self):
+        stored = self.path / "credential.json"
+        stored.write_text(self.credential("stored-new", 5000))
+        self.live_path().parent.mkdir(parents=True)
+        self.live_path().write_text(self.credential("live-old", 1000))
+        ACCX["save_profile"](self.provider, "work", quiet=True, newest_only=True)
+        self.assertIn("stored-new", stored.read_text())
+        self.assertIn("stored-new", self.live_path().read_text())
+        self.live_path().write_text(self.credential("new-login", 1000))
+        ACCX["save_profile"](self.provider, "work", quiet=True)
+        self.assertIn("new-login", stored.read_text())

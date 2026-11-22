@@ -213,3 +213,5 @@ input:focus, textarea:focus { border-color: #737b83; box-shadow: 0 0 0 3px rgba(
 }
 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+:root { --opencode: #d8aa60; --opencode-soft: rgba(216, 170, 96, .08); }

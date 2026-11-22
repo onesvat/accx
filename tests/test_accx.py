@@ -23,6 +23,42 @@ def jwt(payload):
     return f"header.{encoded}.signature"
 
 
+class UsageWindowTests(unittest.TestCase):
+    def test_claude_new_model_window_preserves_reset(self):
+        raw = {"seven_day_fable": {"utilization": 42, "resets_at": "2030-01-08T09:30:00Z"}, "seven_day_opus": None}
+        snapshot = ACCX["usage_snapshot"](ACCX["Provider"]("claude"), raw)
+        self.assertEqual(len(snapshot["windows"]), 1)
+        window = snapshot["windows"][0]
+        self.assertEqual(window["key"], "seven_day_fable")
+        self.assertEqual(window["used_percent"], 42)
+        self.assertEqual(window["resets_at"], "2030-01-08T09:30:00Z")
+
+    def test_claude_limits_array_includes_fable_without_duplicate_totals(self):
+        raw = {
+            "seven_day": {"utilization": 36, "resets_at": None},
+            "limits": [
+                {"kind": "weekly_all", "percent": 36, "resets_at": None},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 56,
+                 "scope": {"model": {"display_name": "Fable", "id": None}},
+                 "resets_at": "2030-01-08T09:30:00Z"},
+            ],
+        }
+        windows = ACCX["usage_windows"](ACCX["Provider"]("claude"), raw)
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[1]["label"], "Fable · 7 gün")
+        self.assertEqual(windows[1]["used_percent"], 56)
+        self.assertEqual(windows[1]["resets_at"], "2030-01-08T09:30:00Z")
+
+    def test_codex_additional_limits_and_code_review(self):
+        raw = {
+            "code_review_rate_limit": {"primary_window": {"used_percent": 12, "reset_at": 1893585600}},
+            "additional_rate_limits": [{"limit_name": "model", "rate_limit": {"secondary_window": {"used_percent": 35, "reset_at": 1893585600}}}],
+        }
+        windows = ACCX["usage_windows"](ACCX["Provider"]("codex"), raw)
+        self.assertEqual([w["used_percent"] for w in windows], [12, 35])
+        self.assertTrue(all(w["resets_at"] for w in windows))
+
+
 class CodexUsageTests(unittest.TestCase):
     def test_fetch_usage_sends_account_header(self):
         request = Mock(return_value={"rate_limit": {}})
@@ -327,7 +363,7 @@ class DashboardDataTests(unittest.TestCase):
             }}))
             process = ACCX["process_due_wakes"]
             with patch.dict(process.__globals__, {"start_wake": Mock(return_value="started")}):
-                results = process(now)
+                results = process(now, now - timedelta(hours=2))
             saved = json.loads((profile_dir / "settings.json").read_text())["wake"]
 
         self.assertEqual(results, [{"provider": "claude", "profile": "work", "result": "started"}])
@@ -346,7 +382,7 @@ class DashboardDataTests(unittest.TestCase):
             }}))
             process = ACCX["process_due_wakes"]
             with patch.dict(process.__globals__, {"start_wake": Mock(return_value="failed: command not found")}):
-                process(now)
+                process(now, now - timedelta(hours=2))
             saved = json.loads((profile_dir / "settings.json").read_text())["wake"]
 
         self.assertTrue(saved["enabled"])
@@ -356,13 +392,13 @@ class DashboardDataTests(unittest.TestCase):
     def test_wake_commands_are_non_interactive(self):
         self.assertEqual(
             ACCX["wake_command"](ACCX["Provider"]("claude"), "ping"),
-            ["claude", "-p", "ping", "--model", "haiku"],
+            ["claude", "-p", "--model", "haiku", "--", "ping"],
         )
         self.assertEqual(
             ACCX["wake_command"](ACCX["Provider"]("codex"), "ping"),
             [
                 "codex", "exec", "--skip-git-repo-check", "--model",
-                "gpt-5.1-codex-mini", "ping",
+                "gpt-5.1-codex-mini", "--", "ping",
             ],
         )
 

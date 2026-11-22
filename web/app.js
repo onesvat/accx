@@ -83,17 +83,28 @@ function renderMetrics() {
 
 function usageTableCell(value, reset, color) {
   const numeric = Number(value);
-  const valid = Number.isFinite(numeric);
+  const valid = value !== null && value !== undefined && Number.isFinite(numeric);
   const percent = valid ? Math.max(0, Math.min(100, numeric)) : 0;
   return `<div class="usage-value"><span>Kullanım</span><strong>${valid ? `${numeric}%` : '—'}</strong></div>
     <div class="mini-track"><i style="--usage:${percent}%;--bar:${color}"></i></div>
-    <span class="reset-text">${escapeHtml(relativeReset(reset))}</span>`;
+    <span class="reset-text">${escapeHtml(relativeReset(reset))}</span>
+    ${reset ? `<span class="reset-text">Sıfırlanma: ${escapeHtml(formatDate(reset))}</span>` : ''}`;
 }
 
 function providerTable(provider) {
   const profiles = (dashboard.profiles || []).filter(item => item.provider === provider);
   const isClaude = provider === 'claude';
-  const title = isClaude ? 'Claude Code' : 'Codex CLI';
+  const isOpenCode = provider === 'opencode';
+  const title = isOpenCode ? 'OpenCode Go' : isClaude ? 'Claude Code' : 'Codex CLI';
+  const baseKeys = new Set(['five_hour', 'seven_day', 'rate_limit.primary_window', 'rate_limit.secondary_window']);
+  const extraWindows = new Map();
+  profiles.forEach(item => (item.usage?.windows || []).forEach(window => {
+    if (!baseKeys.has(window.key)) extraWindows.set(window.key, window.label
+      .replaceAll('seven day', '7 gün').replaceAll('five hour', '5 saat')
+      .replaceAll('code review rate limit', 'Kod inceleme')
+      .replaceAll('additional rate limits.', '')
+      .replaceAll('.primary window', ' · Birincil').replaceAll('.secondary window', ' · İkincil'));
+  }));
   const rows = profiles.length ? profiles.map(item => {
     const usage = item.usage || {};
     const billing = item.billing || {};
@@ -102,10 +113,15 @@ function providerTable(provider) {
     const billingPrice = billing.amount ? `${escapeHtml(billing.amount)} ${escapeHtml(billing.currency)} / ay` : 'Fiyat yok';
     return `<tr class="account-row${item.active ? ' active-row' : ''}" data-id="${escapeHtml(identity)}">
       <td class="profile-cell"><strong class="profile-name">${escapeHtml(item.profile)}</strong></td>
-      <td class="email-cell" title="${escapeHtml(item.email || '')}">${escapeHtml(item.email || 'E-posta bilinmiyor')}</td>
+      <td class="email-cell" title="${escapeHtml(item.email || '')}">${escapeHtml(item.email || (isOpenCode ? 'API anahtarı' : 'E-posta bilinmiyor'))}</td>
       <td><span class="plan-tag">${escapeHtml(item.plan || 'Bilinmiyor')}</span></td>
-      <td class="usage-cell">${usageTableCell(usage.five_hour, usage.five_hour_resets_at, 'var(--green)')}</td>
+      <td class="usage-cell">${usageTableCell(usage.five_hour, usage.five_hour_resets_at, 'var(--green)')}${usage.windows?.find(window => window.key === 'rate_limit.primary_window')?.window_seconds === 2592000 ? '<span class="reset-text">Bu hesapta dönem: 30 gün</span>' : ''}</td>
       <td class="usage-cell">${usageTableCell(usage.seven_day, usage.seven_day_resets_at, 'var(--blue)')}</td>
+      ${Array.from(extraWindows.keys()).map(key => {
+        const window = (usage.windows || []).find(item => item.key === key);
+        return `<td class="usage-cell">${window ? usageTableCell(window.used_percent, window.resets_at, 'var(--blue)') : '—'}</td>`;
+      }).join('')}
+      ${provider === 'codex' ? `<td class="usage-cell"><div class="usage-value"><span>Sıfırlama hakkı</span><strong>${escapeHtml(usage.reset_credits?.available_count ?? '—')}</strong></div><span class="reset-text">Şu an kullanılabilir: ${escapeHtml(usage.reset_credits?.applicable_available_count ?? '—')}</span><span class="reset-text">Kredi bakiyesi: ${escapeHtml(usage.credits?.unlimited ? 'Sınırsız' : usage.credits?.balance ?? '—')}</span></td>` : ''}
       <td class="billing-cell" title="${escapeHtml(billing.note || '')}">
         <button class="billing-editor" type="button" data-action="billing" data-provider="${provider}" data-profile="${escapeHtml(item.profile)}">
           <span class="billing-edit-label">Planı düzenle</span>
@@ -115,7 +131,7 @@ function providerTable(provider) {
       </td>
       <td><div class="row-actions">
         <button class="action-button" type="button" data-action="refresh" data-provider="${provider}" data-profile="${escapeHtml(item.profile)}">Yenile</button>
-        <button class="action-button${item.wake?.enabled ? ' wake-active' : ''}" type="button" data-action="wake" data-provider="${provider}" data-profile="${escapeHtml(item.profile)}">${item.wake?.enabled ? (item.wake.recurrence === 'daily' ? 'Uyandır · Günlük' : 'Uyandır · 1×') : 'Uyandır'}</button>
+        ${!isOpenCode ? `<button class="action-button${item.wake?.enabled ? ' wake-active' : ''}" type="button" data-action="wake" data-provider="${provider}" data-profile="${escapeHtml(item.profile)}">${item.wake?.enabled ? (item.wake.recurrence === 'daily' ? 'Uyandır · Günlük' : 'Uyandır · 1×') : 'Uyandır'}</button>` : ''}
         <button class="action-button switch" type="button" data-action="switch" data-provider="${provider}" data-profile="${escapeHtml(item.profile)}"${item.active ? ' disabled' : ''}>${item.active ? 'Aktif' : 'Etkinleştir'}</button>
       </div></td>
     </tr>`;
@@ -124,11 +140,11 @@ function providerTable(provider) {
   return `<section class="provider-section provider-${provider}" style="--provider:var(--${provider});--active-soft:var(--${provider}-soft)">
     <div class="provider-heading">
       <div class="provider-title"><span class="provider-dot"></span><h2>${title}</h2></div>
-      <p>${profiles.length} profil</p>
+      <p>${profiles.length} profil${isOpenCode ? ' · <button class="action-button" type="button" data-action="add-opencode">Anahtar ekle</button>' : ''}</p>
     </div>
     <div class="table-wrap">
       <table class="account-table">
-        <thead><tr><th>Profil</th><th>Hesap</th><th>Plan</th><th>5 saat</th><th>7 gün</th><th>Abonelik</th><th>İşlemler</th></tr></thead>
+        <thead><tr><th>Profil</th><th>Hesap</th><th>Plan</th><th>5 saat</th><th>7 gün</th>${Array.from(extraWindows.values()).map(label => `<th>${escapeHtml(label)}</th>`).join('')}${provider === 'codex' ? '<th>Limit sıfırlama / kredi</th>' : ''}<th>Abonelik</th><th>İşlemler</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
@@ -136,7 +152,7 @@ function providerTable(provider) {
 }
 
 function renderProfiles() {
-  tablesRoot.innerHTML = providerTable('claude') + providerTable('codex');
+  tablesRoot.innerHTML = providerTable('claude') + providerTable('codex') + providerTable('opencode');
 }
 
 function render() {
@@ -234,7 +250,7 @@ function openSwitch(provider, profile) {
   const item = findProfile(provider, profile);
   if (!item) return;
   switchTarget = { provider, profile };
-  document.getElementById('switchDescription').textContent = `${item.email || profile} hesabı ${provider === 'claude' ? 'Claude Code' : 'Codex CLI'} için aktif profil olacak. Mevcut aktif profil önce otomatik kaydedilir. Açık bir CLI oturumu varsa ayrıca onay istenir.`;
+  document.getElementById('switchDescription').textContent = `${item.email || profile} hesabı ${provider === 'opencode' ? 'OpenCode Go' : provider === 'claude' ? 'Claude Code' : 'Codex CLI'} için aktif profil olacak. Mevcut aktif profil önce otomatik kaydedilir. ${provider === 'opencode' ? 'Yeni anahtarın kullanılması için açık OpenCode oturumunu yeniden başlatın.' : 'Açık bir CLI oturumu varsa ayrıca onay istenir.'}`;
   switchDialog.showModal();
 }
 
@@ -278,7 +294,7 @@ function openWake(provider, profile) {
   if (!item) return;
   const wake = item.wake || {};
   const defaultWake = new Date(Date.now() + 5 * 60 * 1000);
-  document.getElementById('wakeTitle').textContent = `${profile} / ${provider === 'claude' ? 'Claude Code' : 'Codex CLI'}`;
+  document.getElementById('wakeTitle').textContent = `${profile} / ${provider === 'opencode' ? 'OpenCode Go' : provider === 'claude' ? 'Claude Code' : 'Codex CLI'}`;
   document.getElementById('wakeProvider').value = provider;
   document.getElementById('wakeProfile').value = profile;
   document.getElementById('wakeEnabled').checked = true;
@@ -326,7 +342,7 @@ async function confirmSwitch() {
       const sessions = error.data?.active_sessions;
       if (!sessions?.length || error.data?.can_kill === false) throw error;
       const listing = sessions.map(item => `PID ${item.pid}: ${item.command}`).join('\n');
-      const confirmed = window.confirm(`Açık ${provider === 'claude' ? 'Claude Code' : 'Codex CLI'} oturum(lar)ı var:\n\n${listing}\n\nBunları durdurup devam edeyim mi?`);
+      const confirmed = window.confirm(`Açık ${provider === 'opencode' ? 'OpenCode Go' : provider === 'claude' ? 'Claude Code' : 'Codex CLI'} oturum(lar)ı var:\n\n${listing}\n\nBunları durdurup devam edeyim mi?`);
       if (!confirmed) throw error;
       result = await requestSwitch(provider, profile, true);
     }
@@ -345,6 +361,7 @@ tablesRoot.addEventListener('click', event => {
   const button = event.target.closest('[data-action]');
   if (!button) return;
   const { action, provider, profile } = button.dataset;
+  if (action === 'add-opencode') document.getElementById('opencodeDialog').showModal();
   if (action === 'refresh') refreshSingle(provider, profile, button);
   if (action === 'billing') openBilling(provider, profile);
   if (action === 'switch') openSwitch(provider, profile);
@@ -376,3 +393,23 @@ refreshButton.addEventListener('click', () => refreshUsage(true));
 
 loadDashboard().then(() => refreshUsage(false));
 setInterval(() => refreshUsage(false), 15 * 60 * 1000);
+
+document.getElementById('opencodeForm').addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = event.submitter;
+  button.disabled = true;
+  try {
+    const profile = document.getElementById('opencodeProfile').value.trim();
+    const key = document.getElementById('opencodeKey').value.trim();
+    const result = await request('/api/opencode/profiles', {
+      method: 'POST', body: JSON.stringify({ profile, ...(key ? { api_key: key } : {}) })
+    });
+    dashboard = result.dashboard;
+    event.target.reset();
+    document.getElementById('opencodeDialog').close();
+    render();
+    notify('OpenCode profili kaydedildi.');
+    await refreshUsage(false);
+  } catch (error) { notify(error.message, true); }
+  finally { button.disabled = false; }
+});

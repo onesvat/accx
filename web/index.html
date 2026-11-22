@@ -28,6 +28,16 @@
     <div id="tablesRoot" aria-live="polite"></div>
   </main>
 
+  <dialog id="opencodeDialog">
+    <form class="dialog-shell compact" id="opencodeForm">
+      <div class="dialog-head"><h2>OpenCode Go anahtarı</h2><button class="icon-button" data-close-dialog="opencodeDialog" aria-label="Kapat" type="button">×</button></div>
+      <label>Profil adı<input id="opencodeProfile" required pattern="[^./\\][^/\\]*" autocomplete="off" placeholder="personal"></label>
+      <label>API anahtarı<input id="opencodeKey" type="password" autocomplete="new-password" placeholder="Sistemden almak için boş bırakın"></label>
+      <p class="form-note">Boş bırakırsanız sistemdeki opencode-go anahtarı içe aktarılır. Kaydetmek aktif anahtarı değiştirmez; profilde Etkinleştir düğmesini kullanın.</p>
+      <div class="dialog-actions"><button class="button ghost" data-close-dialog="opencodeDialog" type="button">Vazgeç</button><button class="button primary" type="submit">Kaydet</button></div>
+    </form>
+  </dialog>
+
   <dialog id="billingDialog">
     <form method="dialog" class="dialog-shell" id="billingForm">
       <div class="dialog-head">

@@ -25,7 +25,7 @@ accx web
 
 The dashboard combines saved Claude and Codex profiles. It shows current 5-hour and 7-day usage, stores monthly renewal dates, prices, and plan notes, and switches the active CLI profile. Usage is refreshed every 15 minutes while the server is running; use **Refresh usage** for an immediate API refresh.
 
-Each profile can also have an automatic wake schedule. Choose a one-time date or a daily time, enter the prompt, and review the expected five-hour reset window before saving. The scheduler runs in the `accx web` process, so the browser may be closed, but stopping `accx web` also stops scheduled wakes. A wake starts Claude with `haiku` or Codex with `gpt-5.1-codex-mini` in the background using an isolated copy of that profile's credentials, without changing the active terminal account.
+Each profile can also have an automatic wake schedule. Choose a one-time date or a daily time, enter the prompt, and review the expected five-hour reset window before saving. A running `accx web` or `accx machine` process can own the scheduler, so the browser may be closed. Processes sharing the account store use one scheduler. Wakes missed while it is stopped are skipped. A wake starts Claude with `haiku` or Codex with `gpt-5.1-codex-mini` in the background using an isolated copy of that profile's credentials, without changing the active terminal account.
 
 Scheduler and launch events are written as JSON lines to `~/.accx/wake.log`. Command output is written to `~/.accx/<provider>/<profile>/.wake-runtime/wake.log` for troubleshooting failed automatic wakes.
 
@@ -185,3 +185,26 @@ Older vault entries using `.credentials.json`, `.claude.json`, or `auth.json` ar
 ## License
 
 MIT
+
+Kullanım ekranı, API’nin döndürdüğü ek model limitlerini (Fable dahil) ve Codex ek limit pencerelerini otomatik gösterir. Her pencere için kullanım yüzdesi, sıfırlanmaya kalan süre ve yerel tarih/saat gösterilir. Sağlayıcının göndermediği limitler gösterilmez. CLI `list` çıktısı ek pencereleri profilin altında listeler.
+
+
+### OpenCode Go
+
+Panelde **OpenCode Go → Anahtar ekle** ile profil adı ve API anahtarını girin.
+Anahtarı boş bırakırsanız sistemdeki `opencode-go` anahtarı içe aktarılır.
+**Etkinleştir**, yalnızca Go anahtarını değiştirir; diğer sağlayıcıların kimlikleri korunur.
+OpenCode v2 için `auth export/import`, eski sürümlerde
+`~/.local/share/opencode/auth.json` kullanılır (`XDG_DATA_HOME` desteklenir).
+Açık OpenCode oturumunu değişiklikten sonra yeniden başlatın.
+Go kullanım yüzdeleri ve sıfırlanma tarihleri 5 saat, hafta ve ay için yenilenir.
+Zen bakiyesi bu endpoint tarafından verilmez. Anahtarlar panel yanıtlarına eklenmez.
+
+```sh
+accx opencode save default    # sistemdeki Go anahtarını kaydet
+accx opencode add personal    # gizli terminal girdisiyle yeni anahtar ekle
+accx opencode switch personal
+accx opencode list --api
+```
+
+The [local machine interface](docs/machine-interface.md) provides a versioned JSONL connection for the Anka desktop bridge.

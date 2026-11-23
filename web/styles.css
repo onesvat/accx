@@ -16,6 +16,8 @@
   --claude-soft: #fbf1ed;
   --codex: #46733b;
   --codex-soft: #eef5ec;
+  --agy: #2b6cb0;
+  --agy-soft: #ebf4ff;
   --danger: #b33a3a;
   --radius: 8px;
 }
@@ -81,6 +83,7 @@ h1, h2, h3, p { margin-top: 0; }
 .wake-plan-row { --provider-color: var(--primary); }
 .wake-plan-row.provider-claude { --provider-color: var(--claude); }
 .wake-plan-row.provider-codex { --provider-color: var(--codex); }
+.wake-plan-row.provider-agy { --provider-color: var(--agy); }
 .table-profile { display: flex; align-items: center; gap: 9px; min-width: 120px; }
 .provider-mark { flex: 0 0 auto; width: 7px; height: 30px; border-radius: 3px; background: var(--provider-color); }
 .table-profile strong { display: block; font: 700 12px/1.2 "Courier New", monospace; }

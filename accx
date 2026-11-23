@@ -49,9 +49,28 @@ NOTIFY_STATE_SCHEMA = 1
 WAKE_LOG_LOCK = threading.Lock()
 STORE_LOCK = threading.RLock()
 STORE_SCOPE = threading.local()
-MACHINE_PROVIDERS = ("claude", "codex")
+MACHINE_PROVIDERS = ("claude", "codex", "agy")
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+AGY_TOKEN_URL = "https://oauth2.googleapis.com/token"
+AGY_QUOTA_URL = "https://aicode.googleapis.com/v1alpha:fetchQuotaStatus"
+AGY_LICENSES_URL = "https://aicode.googleapis.com/v1alpha:fetchLicenses"
+AGY_WAKE_MODEL = "gemini-3.8-flash-low"
+
+AGY_BUCKET_SPECS = {
+    "gemini-5h": ("gemini_five_hour", "Gemini · 5 saat", 18000),
+    "gemini-weekly": ("gemini_seven_day", "Gemini · 7 gün", 604800),
+    "3p-5h": ("three_party_five_hour", "Claude/GPT · 5 saat", 18000),
+    "3p-weekly": ("three_party_seven_day", "Claude/GPT · 7 gün", 604800),
+    "gemini-argon-wtu-weekly": ("gemini_argon_wtu_weekly", "Argon · 7 gün", 604800),
+}
+AGY_BUCKET_ORDER = (
+    "gemini-5h",
+    "gemini-weekly",
+    "3p-5h",
+    "3p-weekly",
+    "gemini-argon-wtu-weekly",
+)
 
 
 class Colors:
@@ -264,13 +283,13 @@ def run_json_command(args: list[str], timeout: int = 8) -> dict[str, Any]:
 
 class Provider:
     def __init__(self, name: str) -> None:
-        if name not in {"claude", "codex", "opencode"}:
-            die(f"unknown provider '{name}', expected claude, codex or opencode")
+        if name not in {"claude", "codex", "agy", "opencode"}:
+            die(f"unknown provider '{name}', expected claude, codex, agy or opencode")
         self.name = name
 
     @property
     def display(self) -> str:
-        return {"claude": "Claude Code", "codex": "Codex CLI", "opencode": "OpenCode Go"}[self.name]
+        return {"claude": "Claude Code", "codex": "Codex CLI", "agy": "Antigravity", "opencode": "OpenCode Go"}[self.name]
 
     @property
     def cli(self) -> str:
@@ -291,7 +310,9 @@ class Provider:
             if platform.system() == "Windows":
                 return Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".claude" / ".credentials.json"
             return Path.home() / ".claude" / ".credentials.json"
-
+        if self.name == "agy":
+            base = Path(os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "~/.gemini/antigravity-cli")).expanduser()
+            return base / "antigravity-oauth-token"
         if self.name == "opencode":
             return Path(os.environ.get("XDG_DATA_HOME", "~/.local/share")).expanduser() / "opencode" / "auth.json"
         codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
@@ -312,6 +333,8 @@ class Provider:
             return current
         if self.name == "claude":
             return pdir / ".credentials.json"
+        if self.name == "agy":
+            return pdir / "antigravity-oauth-token"
         return pdir / "auth.json"
 
     def stored_meta_path(self, profile: str) -> Path:
@@ -326,6 +349,8 @@ class Provider:
     def login_command(self, extra: list[str]) -> list[str]:
         if self.name == "claude":
             return ["claude", "auth", "login", *extra]
+        if self.name == "agy":
+            return ["agy", *extra]
         return ["codex", "login", *extra]
 
 
@@ -368,6 +393,9 @@ def credential_refresh_token(provider: Provider, cred: dict[str, Any]) -> str | 
     if provider.name == "claude":
         oauth = cred.get("claudeAiOauth") or {}
         return oauth.get("refreshToken")
+    if provider.name == "agy":
+        token = cred.get("token")
+        return token.get("refresh_token") if isinstance(token, dict) else None
     tokens = cred.get("tokens") or {}
     return tokens.get("refresh_token") or cred.get("refresh_token")
 
@@ -378,6 +406,9 @@ def credential_access_token(provider: Provider, cred: dict[str, Any]) -> str | N
     if provider.name == "claude":
         oauth = cred.get("claudeAiOauth") or {}
         return oauth.get("accessToken")
+    if provider.name == "agy":
+        token = cred.get("token")
+        return token.get("access_token") if isinstance(token, dict) else None
     tokens = cred.get("tokens") or {}
     return tokens.get("access_token") or cred.get("access_token")
 
@@ -400,6 +431,10 @@ def credential_access_expiry_ms(provider: Provider, cred: dict[str, Any]) -> int
             return int(value) if value else None
         except Exception:
             return None
+    if provider.name == "agy":
+        token = cred.get("token")
+        expiry = parse_iso_datetime(token.get("expiry")) if isinstance(token, dict) else None
+        return int(expiry.timestamp() * 1000) if expiry else None
 
     tokens = cred.get("tokens") or {}
     value = tokens.get("expires_at") or cred.get("expires_at")
@@ -420,6 +455,8 @@ def credential_access_expiry_ms(provider: Provider, cred: dict[str, Any]) -> int
 def credential_summary(provider: Provider, cred: dict[str, Any], live: bool = False, legacy_cfg: Path | None = None) -> dict[str, Any]:
     if provider.name == "claude":
         return claude_metadata(provider, cred, live=live, legacy_cfg=legacy_cfg)
+    if provider.name == "agy":
+        return agy_metadata(provider, cred, use_api=live)
     if provider.name == "opencode":
         return {"schema": SCHEMA_VERSION, "provider": "opencode", "saved_at": now_iso(),
                 "credential": {"refresh_sha256": sha256_text(cred.get("key"))},
@@ -505,6 +542,142 @@ def codex_metadata(provider: Provider, cred: dict[str, Any]) -> dict[str, Any]:
         "codex": {
             "auth_mode": cred.get("auth_mode"),
             "last_refresh": cred.get("last_refresh"),
+        },
+    }
+
+
+def normalize_agy_plan(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    lowered = value.strip().lower()
+    for token in ("ultra", "pro", "free", "team", "business", "enterprise", "plus"):
+        if token in lowered:
+            return token
+    return lowered.replace("-tier", "").replace("google ai ", "").strip().replace(" ", "_")
+
+
+def agy_fetch_plan(token: str) -> str | None:
+    data = http_get_json(AGY_LICENSES_URL, {"Authorization": f"Bearer {token}", "User-Agent": "antigravity"})
+    if isinstance(data, dict) and isinstance(data.get("licenses"), list) and data["licenses"]:
+        lic = data["licenses"][0]
+        if isinstance(lic, dict):
+            return normalize_agy_plan(lic.get("userTier") or lic.get("tierDisplayName"))
+    return None
+
+
+def agy_token_needs_refresh(cred: dict[str, Any], skew_seconds: int = 60) -> bool:
+    token = cred.get("token")
+    if not isinstance(token, dict) or not token.get("access_token"):
+        return False
+    expiry = parse_iso_datetime(token.get("expiry"))
+    if expiry is None:
+        return True
+    return expiry.timestamp() <= time.time() + skew_seconds
+
+
+def agy_oauth_candidates() -> list[tuple[str, str]]:
+    env_id = os.environ.get("AGY_CLIENT_ID", "").strip()
+    env_secret = os.environ.get("AGY_CLIENT_SECRET", "").strip()
+    if env_id and env_secret:
+        return [(env_id, env_secret)]
+    cached = read_json(accx_home() / "agy-oauth.json", {}, strict=False)
+    if isinstance(cached, dict):
+        cid = cached.get("client_id")
+        csec = cached.get("client_secret")
+        if isinstance(cid, str) and cid and isinstance(csec, str) and csec:
+            return [(cid, csec)]
+    exe = shutil.which("agy")
+    binary = Path(exe) if exe else Path("~/.local/bin/agy").expanduser()
+    if not binary.is_file():
+        return []
+    try:
+        data = binary.read_bytes()
+    except OSError:
+        return []
+    ids = list(dict.fromkeys(
+        m.decode("ascii")
+        for m in re.findall(rb"[0-9]{10,15}-[a-z0-9]{20,40}\.apps\.googleusercontent\.com", data)
+    ))
+    secrets_list = list(dict.fromkeys(
+        m.decode("ascii")
+        for m in re.findall(rb"GOCSPX-[A-Za-z0-9_-]{28}", data)
+    ))
+    return [(cid, csec) for cid in ids for csec in secrets_list]
+
+
+def refresh_agy_credential(cred: dict[str, Any]) -> bool:
+    if not isinstance(cred, dict) or not isinstance(cred.get("token"), dict):
+        return False
+    token = cred["token"]
+    refresh = token.get("refresh_token")
+    if not refresh or not token.get("access_token"):
+        return False
+    candidates = agy_oauth_candidates()
+    if not candidates:
+        return False
+    response = None
+    matched: tuple[str, str] | None = None
+    for client_id, client_secret in candidates:
+        candidate_resp = http_post_form_json(
+            AGY_TOKEN_URL,
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+        )
+        if isinstance(candidate_resp, dict) and candidate_resp.get("access_token"):
+            response = candidate_resp
+            matched = (client_id, client_secret)
+            break
+    if not isinstance(response, dict) or not response.get("access_token"):
+        return False
+    if matched and not (os.environ.get("AGY_CLIENT_ID") and os.environ.get("AGY_CLIENT_SECRET")):
+        try:
+            write_json(accx_home() / "agy-oauth.json", {"client_id": matched[0], "client_secret": matched[1]})
+        except OSError:
+            pass
+    token["access_token"] = response["access_token"]
+    if isinstance(response.get("refresh_token"), str) and response["refresh_token"]:
+        token["refresh_token"] = response["refresh_token"]
+    if isinstance(response.get("token_type"), str) and response["token_type"]:
+        token["token_type"] = response["token_type"]
+    if isinstance(response.get("expires_in"), (int, float)):
+        token["expires_in"] = int(response["expires_in"])
+        token["expiry"] = (datetime.now().astimezone() + timedelta(seconds=float(response["expires_in"]))).isoformat()
+    return True
+
+
+def agy_metadata(provider: Provider, cred: dict[str, Any], use_api: bool = False) -> dict[str, Any]:
+    email = cred.get("id_token_email") if isinstance(cred.get("id_token_email"), str) else None
+    plan = normalize_agy_plan(cred.get("plan"))
+    access = credential_access_token(provider, cred)
+    refresh = credential_refresh_token(provider, cred)
+    if use_api and access:
+        if agy_token_needs_refresh(cred) and refresh_agy_credential(cred):
+            access = credential_access_token(provider, cred)
+            refresh = credential_refresh_token(provider, cred)
+        plan = agy_fetch_plan(access) or plan
+    access_exp = credential_access_expiry_ms(provider, cred)
+    return {
+        "schema": SCHEMA_VERSION,
+        "provider": "agy",
+        "saved_at": now_iso(),
+        "credential": {
+            "refresh_sha256": sha256_text(refresh),
+            "has_refresh": bool(refresh),
+            "access_expires_at": epoch_to_iso(access_exp),
+            "auth_mode": cred.get("auth_method"),
+        },
+        "identity": {
+            "email": email,
+            "display_name": None,
+            "account_id": email,
+            "organization_id": None,
+            "organization_name": None,
+            "plan": plan,
+            "billing": None,
         },
     }
 
@@ -623,6 +796,8 @@ def _process_config_dir(provider: Provider, env: dict[str, str]) -> str:
     home = _process_home(env)
     if provider.name == "claude":
         value = env.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude")
+    elif provider.name == "agy":
+        value = env.get("ANTIGRAVITY_APP_DATA_DIR") or os.path.join(home, ".gemini", "antigravity-cli")
     else:
         value = env.get("CODEX_HOME") or os.path.join(home, ".codex")
     if value == "~" or value.startswith("~/"):
@@ -653,6 +828,11 @@ def _is_provider_process(
         if "--chrome-native-host" in args:
             return False
         if len(args) > 1 and args[1] == "mcp":
+            return False
+    elif provider.name == "agy":
+        if "agy" not in names:
+            return False
+        if len(args) > 1 and args[1] in {"mcp", "acp", "version", "--version", "help", "--help", "models", "changelog", "install", "update", "mic-serve"}:
             return False
     else:
         is_codex_script = any(arg.endswith("/codex.js") or arg.endswith("/codex") for arg in args[:2])
@@ -910,7 +1090,7 @@ def is_active(provider: Provider, profile: str) -> bool:
         if stored_org and live_org:
             return stored_org == live_org
         return True
-    return bool(stored_email and live_email and stored_email == live_email and provider.name == "claude")
+    return bool(stored_email and live_email and stored_email == live_email and provider.name in {"claude", "agy"})
 
 
 def detect_active_profile(provider: Provider) -> str | None:
@@ -1118,6 +1298,8 @@ def warn_if_unusable_token(provider: Provider, cred: dict[str, Any], profile: st
         warn(f"stored access token{target} is expired and no refresh token was found")
         if provider.name == "claude":
             print("  Run 'claude auth login', then 'accx claude save <profile>' to update it.")
+        elif provider.name == "agy":
+            print("  Run 'agy' to sign in, then 'accx agy save <profile>' to update it.")
         else:
             print("  Run 'codex login', then 'accx codex save <profile>' to update it.")
 
@@ -1125,6 +1307,8 @@ def warn_if_unusable_token(provider: Provider, cred: dict[str, Any], profile: st
 def env_overrides(provider: Provider) -> list[str]:
     if provider.name == "opencode":
         return [name for name in ("OPENCODE_API_KEY",) if os.environ.get(name)]
+    if provider.name == "agy":
+        return [name for name in ("ANTIGRAVITY_APP_DATA_DIR",) if os.environ.get(name)]
     if provider.name == "claude":
         names = [
             "CLAUDE_CODE_USE_BEDROCK",
@@ -1247,6 +1431,67 @@ def codex_token_needs_refresh(cred: dict[str, Any]) -> bool:
     return expiry is not None and expiry <= ms_now() + 60_000
 
 
+def agy_collect_buckets(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    collected: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    summary = raw.get("quotaSummary") if isinstance(raw.get("quotaSummary"), dict) else {}
+    groups = summary.get("groups") if isinstance(summary.get("groups"), list) else []
+    candidates: list[Any] = []
+    for group in groups:
+        if isinstance(group, dict) and isinstance(group.get("buckets"), list):
+            candidates.extend(group["buckets"])
+    if not candidates:
+        for fallback in (summary.get("buckets"), raw.get("buckets")):
+            if isinstance(fallback, list):
+                candidates.extend(fallback)
+                break
+    for bucket in candidates:
+        if not isinstance(bucket, dict):
+            continue
+        bid = bucket.get("bucketId")
+        if not isinstance(bid, str) or not bid:
+            continue
+        if bid not in collected:
+            order.append(bid)
+            collected[bid] = bucket
+    ordered_ids = [bid for bid in AGY_BUCKET_ORDER if bid in collected]
+    ordered_ids.extend(bid for bid in order if bid not in AGY_BUCKET_SPECS)
+    return [collected[bid] for bid in ordered_ids]
+
+
+def agy_usage_windows(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    windows: list[dict[str, Any]] = []
+    for bucket in agy_collect_buckets(raw):
+        bid = str(bucket.get("bucketId") or "")
+        rem_raw = bucket.get("remainingFraction")
+        if rem_raw is not None:
+            try:
+                rem: float | None = float(rem_raw)
+            except (TypeError, ValueError):
+                rem = None
+        elif bucket.get("resetTime"):
+            # Proto3 omits default 0.0 remainingFraction when quota is exhausted.
+            rem = 0.0
+        else:
+            rem = None
+        used_percent = round(max(0.0, min(100.0, (1.0 - rem) * 100.0)), 1) if rem is not None else None
+        if bid in AGY_BUCKET_SPECS:
+            key, label, seconds = AGY_BUCKET_SPECS[bid]
+        else:
+            win = str(bucket.get("refreshWindowLabel") or bucket.get("window") or "").lower()
+            seconds = 18000 if ("5h" in win or "5_hour" in win) else (604800 if ("week" in win or "7d" in win) else None)
+            key = re.sub(r"[^a-z0-9_]+", "_", bid.lower()).strip("_") or "limit"
+            label = str(bucket.get("displayName") or bid)
+        windows.append({
+            "key": key,
+            "label": label,
+            "used_percent": used_percent,
+            "resets_at": reset_value_to_iso(bucket.get("resetTime")),
+            "window_seconds": seconds,
+        })
+    return windows
+
+
 def fetch_usage(provider: Provider, cred: dict[str, Any]) -> dict[str, Any] | None:
     access = credential_access_token(provider, cred)
     if not access:
@@ -1256,6 +1501,14 @@ def fetch_usage(provider: Provider, cred: dict[str, Any]) -> dict[str, Any] | No
             "https://api.anthropic.com/api/oauth/usage",
             {"Authorization": f"Bearer {access}", "anthropic-beta": "oauth-2025-04-20"},
         )
+    if provider.name == "agy":
+        headers = {"Authorization": f"Bearer {access}", "User-Agent": "antigravity"}
+        data = http_get_json(AGY_QUOTA_URL, headers)
+        if isinstance(data, dict):
+            plan = agy_fetch_plan(access)
+            if plan:
+                data["plan_type"] = plan
+        return data
     if provider.name == "opencode":
         return http_get_json("https://opencode.ai/zen/go/v1/usage", {"Authorization": f"Bearer {access}", "User-Agent": "accx/" + VERSION})
     headers = {"Authorization": f"Bearer {access}", "User-Agent": "codex-cli"}
@@ -1282,6 +1535,8 @@ def usage_windows(provider: Provider, raw: dict[str, Any]) -> list[dict[str, Any
             "window_seconds": value.get("limit_window_seconds"),
         })
 
+    if provider.name == "agy":
+        return agy_usage_windows(raw)
     if provider.name == "opencode":
         for name, key in (("rolling", "five_hour"), ("weekly", "seven_day"), ("monthly", "monthly")):
             add(key, (raw.get("usage") or {}).get(name), "percent", "resetsAt")
@@ -1386,6 +1641,17 @@ def format_reset_time(value: Any, now: datetime | None = None) -> str:
 
 
 def usage_snapshot(provider: Provider, raw: dict[str, Any], recorded_at: str | None = None) -> dict[str, Any]:
+    if provider.name == "agy":
+        windows = usage_windows(provider, raw)
+        by_key = {window["key"]: window for window in windows}
+        return {
+            "recorded_at": recorded_at or now_iso(),
+            "windows": windows,
+            "five_hour": by_key.get("gemini_five_hour", {}).get("used_percent"),
+            "seven_day": by_key.get("gemini_seven_day", {}).get("used_percent"),
+            "five_hour_resets_at": by_key.get("gemini_five_hour", {}).get("resets_at"),
+            "seven_day_resets_at": by_key.get("gemini_seven_day", {}).get("resets_at"),
+        }
     if provider.name == "opencode":
         windows = usage_windows(provider, raw)
         by_key = {window["key"]: window for window in windows}
@@ -1463,7 +1729,7 @@ def process_due_notifications(now: datetime | None = None) -> list[dict[str, Any
     changed = False
     results: list[dict[str, Any]] = []
 
-    for provider_name in ("claude", "codex"):
+    for provider_name in MACHINE_PROVIDERS:
         provider = Provider(provider_name)
         for profile in list_profiles(provider):
             raw, fetched_at = load_usage_cache(provider, profile)
@@ -1786,7 +2052,11 @@ def credential_expiry_or_zero(provider: Provider, path: Path) -> int:
 
 
 def runtime_credential_name(provider: Provider) -> str:
-    return ".credentials.json" if provider.name == "claude" else "auth.json"
+    if provider.name == "claude":
+        return ".credentials.json"
+    if provider.name == "agy":
+        return "antigravity-oauth-token"
+    return "auth.json"
 
 
 def agent_runtime_dir(provider: Provider, profile: str) -> Path:
@@ -1840,12 +2110,26 @@ def prepare_agent_runtime(provider: Provider, profile: str) -> Path | None:
         source_config = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "config.toml"
         if source_config.exists():
             copy_file(source_config, runtime_dir / "config.toml")
+    elif provider.name == "agy":
+        source_settings = provider.live_credential_path().parent / "settings.json"
+        if source_settings.exists() and not source_settings.is_symlink():
+            copy_file(source_settings, runtime_dir / "settings.json")
     return runtime_dir
+
+
+def wake_model_name(provider: Provider) -> str:
+    if provider.name == "claude":
+        return "haiku"
+    if provider.name == "agy":
+        return AGY_WAKE_MODEL
+    return "gpt-5.1-codex-mini"
 
 
 def wake_command(provider: Provider, prompt: str) -> list[str]:
     if provider.name == "claude":
         return ["claude", "-p", "--model", "haiku", "--", prompt]
+    if provider.name == "agy":
+        return ["agy", "-p", "--model", AGY_WAKE_MODEL, "--", prompt]
     return [
         "codex",
         "exec",
@@ -1916,7 +2200,8 @@ def start_wake(
         wake_log("wake_failed", provider=provider.name, profile=profile, error=result)
         return result
     if shared_dir is not None:
-        env["CLAUDE_CONFIG_DIR" if provider.name == "claude" else "CODEX_HOME"] = str(shared_dir)
+        env_var = {"claude": "CLAUDE_CONFIG_DIR", "agy": "ANTIGRAVITY_APP_DATA_DIR"}.get(provider.name, "CODEX_HOME")
+        env[env_var] = str(shared_dir)
     try:
         with output_path.open("ab") as output:
             process = subprocess.Popen(
@@ -2041,7 +2326,7 @@ def read_text_tail(path: Path, max_bytes: int = 65536) -> str:
 
 def wake_monitor_data(event_limit: int = 200) -> dict[str, Any]:
     plans = []
-    for provider_name in ("claude", "codex"):
+    for provider_name in MACHINE_PROVIDERS:
         provider = Provider(provider_name)
         for profile in list_profiles(provider):
             wake = load_wake(provider, profile)
@@ -2051,7 +2336,7 @@ def wake_monitor_data(event_limit: int = 200) -> dict[str, Any]:
             plans.append({
                 "provider": provider_name,
                 "profile": profile,
-                "model": "haiku" if provider_name == "claude" else "gpt-5.1-codex-mini",
+                "model": wake_model_name(provider),
                 "output": read_text_tail(provider.profile_dir(profile) / ".wake-runtime" / "wake.log"),
                 **public,
             })
@@ -2082,21 +2367,41 @@ def usage_cache_values(
     cache_path = provider.stored_cache_path(profile)
     raw = None
     if use_api:
-        if provider.name == "codex":
-            # Token rotation writes the live auth file. Do not do that while a Codex
+        live_conflict = False
+        if provider.name in {"codex", "agy"}:
+            # Token rotation writes the live auth file. Do not do that while a
             # session is running: the session may write its own copy back.
             live_conflict = active and bool(find_active_sessions(provider, include_app_server=True))
             refreshed = False
-            if codex_token_needs_refresh(cred) and not live_conflict:
-                refreshed = refresh_codex_credential(cred)
+            needs_refresh = (
+                codex_token_needs_refresh(cred)
+                if provider.name == "codex"
+                else agy_token_needs_refresh(cred)
+            )
+            if needs_refresh and not live_conflict:
+                refreshed = (
+                    refresh_codex_credential(cred)
+                    if provider.name == "codex"
+                    else refresh_agy_credential(cred)
+                )
             if refreshed and active and not live_conflict:
                 write_json(provider.live_credential_path(), cred)
             if refreshed or (active and not live_conflict):
                 write_json(provider.stored_credential_path(profile), cred)
-                write_json(provider.stored_meta_path(profile), credential_summary(provider, cred))
+                write_json(provider.stored_meta_path(profile), credential_summary(provider, cred, live=provider.name == "agy"))
         raw = fetch_usage(provider, cred)
+        if raw is None and provider.name == "agy" and not live_conflict and refresh_agy_credential(cred):
+            if active:
+                write_json(provider.live_credential_path(), cred)
+            write_json(provider.stored_credential_path(profile), cred)
+            write_json(provider.stored_meta_path(profile), credential_summary(provider, cred, live=True))
+            raw = fetch_usage(provider, cred)
         attempt_at = now_iso()
         if isinstance(raw, dict) and raw:
+            if provider.name == "agy" and raw.get("plan_type"):
+                meta = load_profile_meta(provider, profile)
+                meta.setdefault("identity", {})["plan"] = normalize_agy_plan(raw.get("plan_type"))
+                write_json(provider.stored_meta_path(profile), meta)
             write_json(cache_path, {"fetched_at": attempt_at, "raw": raw,
                                     "last_attempt_at": attempt_at, "refresh_status": "refreshed"})
         else:
@@ -2111,10 +2416,16 @@ def usage_cache_values(
             raw = cache.get("raw")
     if not isinstance(raw, dict):
         return "?", "?", "?", "?"
-    if provider.name == "opencode":
+    if provider.name in {"opencode", "agy"}:
         snapshot = usage_snapshot(provider, raw)
-        return (str(snapshot.get("five_hour", "?")), str(snapshot.get("seven_day", "?")),
-                format_reset_time(snapshot.get("five_hour_resets_at")), format_reset_time(snapshot.get("seven_day_resets_at")))
+        five = snapshot.get("five_hour")
+        seven = snapshot.get("seven_day")
+        return (
+            "?" if five is None else str(five),
+            "?" if seven is None else str(seven),
+            format_reset_time(snapshot.get("five_hour_resets_at")),
+            format_reset_time(snapshot.get("seven_day_resets_at")),
+        )
     if provider.name == "claude":
         five = raw.get("five_hour") or {}
         seven = raw.get("seven_day") or {}
@@ -2175,7 +2486,7 @@ def list_command(provider: Provider, use_api: bool) -> None:
         )
         raw, _ = load_usage_cache(provider, profile)
         for window in usage_windows(provider, raw or {}):
-            if window["key"] in {"five_hour", "seven_day", "rate_limit.primary_window", "rate_limit.secondary_window"}:
+            if window["key"] in {"five_hour", "seven_day", "gemini_five_hour", "gemini_seven_day", "rate_limit.primary_window", "rate_limit.secondary_window"}:
                 continue
             print(f"    {window['label']}: {window['used_percent']}% · {format_reset_time(window['resets_at'])}")
     print()
@@ -2216,7 +2527,7 @@ def profile_dashboard_data(provider: Provider, profile: str, active: str | None 
 def dashboard_data() -> dict[str, Any]:
     profiles = []
     totals: dict[str, Decimal] = {}
-    for provider_name in ("claude", "codex", "opencode"):
+    for provider_name in ("claude", "codex", "agy", "opencode"):
         provider = Provider(provider_name)
         active = detect_active_profile(provider)
         for profile in list_profiles(provider):
@@ -2297,14 +2608,14 @@ def refresh_profile_usage(provider: Provider, profile: str, force: bool = False)
 
 
 def refresh_dashboard_usage(provider_name: str | None = None, profile: str | None = None, force: bool = False) -> list[dict[str, Any]]:
-    if provider_name is not None and provider_name not in {"claude", "codex", "opencode"}:
-        raise ValueError("provider must be claude or codex")
+    if provider_name is not None and provider_name not in {"claude", "codex", "agy", "opencode"}:
+        raise ValueError("provider must be claude, codex, agy or opencode")
     if profile is not None and not provider_name:
         raise ValueError("provider is required when profile is specified")
     if profile is not None and profile not in list_profiles(Provider(provider_name)):
         raise ValueError(f"profile '{profile}' not found")
     results = []
-    names = (provider_name,) if provider_name else ("claude", "codex", "opencode")
+    names = (provider_name,) if provider_name else ("claude", "codex", "agy", "opencode")
     for name in names:
         provider = Provider(name)
         targets = (profile,) if profile else tuple(list_profiles(provider))
@@ -2659,7 +2970,7 @@ def machine_profile(provider: Provider, profile: str, active: str | None, now: d
         meta = credential_summary(provider, cred) if provider.name == "codex" else load_profile_meta(provider, profile)
         value = (meta.get("identity") or {}).get("plan")
         if isinstance(value, str) and value.lower() in {
-            "free", "go", "plus", "pro", "max", "team", "business", "enterprise",
+            "free", "go", "plus", "pro", "ultra", "max", "team", "business", "enterprise",
             "education", "edu", "max_5x", "max_20x", "claude_pro", "claude_max",
         }:
             plan = value
@@ -2880,7 +3191,7 @@ def run_machine() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="accx",
-        description="Switch between Claude Code and Codex CLI accounts.",
+        description="Switch between Claude Code, Codex CLI, Antigravity and OpenCode accounts.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"accx {VERSION}")
@@ -2892,7 +3203,7 @@ def build_parser() -> argparse.ArgumentParser:
     web_p.add_argument("--bind", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
     web_p.add_argument("--no-open", action="store_true", help="do not open a browser")
 
-    for provider_name in ("claude", "codex", "opencode"):
+    for provider_name in ("claude", "codex", "agy", "opencode"):
         p = sub.add_parser(provider_name)
         commands = p.add_subparsers(dest="command", required=True)
 

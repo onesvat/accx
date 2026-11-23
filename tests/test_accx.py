@@ -926,5 +926,106 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertTrue(handler.mutation_allowed())
 
 
+class AgyUsageAndRefreshTests(unittest.TestCase):
+    def test_agy_usage_windows_and_snapshot_convert_remaining_fraction(self):
+        raw = {
+            "quotaSummary": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-weekly",
+                                "displayName": "Weekly Limit Remaining",
+                                "refreshWindowLabel": "weekly",
+                                "remainingFraction": 0.725,
+                                "resetTime": "2026-11-29T19:27:38Z",
+                            },
+                            {
+                                "bucketId": "gemini-5h",
+                                "displayName": "Five Hour Limit Remaining",
+                                "refreshWindowLabel": "5h",
+                                "resetTime": "2026-11-23T15:27:38Z",
+                            },
+                        ],
+                    },
+                    {
+                        "displayName": "Claude and GPT models",
+                        "buckets": [
+                            {
+                                "bucketId": "3p-5h",
+                                "displayName": "Five Hour Limit Remaining",
+                                "refreshWindowLabel": "5h",
+                                "remainingFraction": 1,
+                                "resetTime": "2026-11-23T16:14:16Z",
+                            },
+                            {
+                                "bucketId": "3p-weekly",
+                                "displayName": "Weekly Limit Remaining",
+                                "refreshWindowLabel": "weekly",
+                                "remainingFraction": 0.5,
+                                "resetTime": "2026-11-30T11:14:16Z",
+                            },
+                        ],
+                    },
+                ]
+            }
+        }
+        provider = ACCX["Provider"]("agy")
+        snapshot = ACCX["usage_snapshot"](provider, raw)
+        self.assertEqual(snapshot["five_hour"], 100.0)
+        self.assertEqual(snapshot["seven_day"], 27.5)
+        self.assertEqual(
+            [w["key"] for w in snapshot["windows"]],
+            ["gemini_five_hour", "gemini_seven_day", "three_party_five_hour", "three_party_seven_day"],
+        )
+        self.assertEqual([w["used_percent"] for w in snapshot["windows"]], [100.0, 27.5, 0.0, 50.0])
+
+    def test_agy_fetch_usage_and_token_refresh(self):
+        request = Mock(side_effect=[{"quotaSummary": {"groups": []}}, {"licenses": [{"userTier": "g1-pro-tier"}]}])
+        fetch_usage = ACCX["fetch_usage"]
+        with patch.dict(fetch_usage.__globals__, {"http_get_json": request}):
+            result = fetch_usage(
+                ACCX["Provider"]("agy"),
+                {"token": {"access_token": "agy-access", "refresh_token": "agy-refresh"}},
+            )
+        self.assertEqual(result["plan_type"], "pro")
+        self.assertEqual(
+            request.call_args_list[0].args,
+            (ACCX["AGY_QUOTA_URL"], {"Authorization": "Bearer agy-access", "User-Agent": "antigravity"}),
+        )
+        self.assertEqual(
+            request.call_args_list[1].args,
+            (ACCX["AGY_LICENSES_URL"], {"Authorization": "Bearer agy-access", "User-Agent": "antigravity"}),
+        )
+
+        post = Mock(return_value={"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 3600})
+        refresh = ACCX["refresh_agy_credential"]
+        cred = {
+            "token": {
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "expiry": "2020-01-01T00:00:00Z",
+            }
+        }
+        self.assertTrue(ACCX["agy_token_needs_refresh"](cred))
+        with patch.dict(os.environ, {"AGY_CLIENT_ID": "test-client-id", "AGY_CLIENT_SECRET": "test-client-secret"}), patch.dict(
+            refresh.__globals__, {"http_post_form_json": post}
+        ):
+            self.assertTrue(refresh(cred))
+        self.assertEqual(cred["token"]["access_token"], "new-access")
+        self.assertEqual(cred["token"]["refresh_token"], "new-refresh")
+        self.assertEqual(cred["token"]["expires_in"], 3600)
+        post.assert_called_once_with(
+            ACCX["AGY_TOKEN_URL"],
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": "old-refresh",
+                "client_id": "test-client-id",
+                "client_secret": "test-client-secret",
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

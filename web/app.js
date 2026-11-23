@@ -91,12 +91,25 @@ function usageTableCell(value, reset, color) {
     ${reset ? `<span class="reset-text">Sıfırlanma: ${escapeHtml(formatDate(reset))}</span>` : ''}`;
 }
 
+function providerLabel(provider) {
+  return ({
+    claude: 'Claude Code',
+    codex: 'Codex CLI',
+    agy: 'Antigravity',
+    opencode: 'OpenCode Go',
+  })[provider] || provider;
+}
+
 function providerTable(provider) {
   const profiles = (dashboard.profiles || []).filter(item => item.provider === provider);
-  const isClaude = provider === 'claude';
   const isOpenCode = provider === 'opencode';
-  const title = isOpenCode ? 'OpenCode Go' : isClaude ? 'Claude Code' : 'Codex CLI';
-  const baseKeys = new Set(['five_hour', 'seven_day', 'rate_limit.primary_window', 'rate_limit.secondary_window']);
+  const isAgy = provider === 'agy';
+  const title = providerLabel(provider);
+  const baseKeys = new Set([
+    'five_hour', 'seven_day',
+    'gemini_five_hour', 'gemini_seven_day',
+    'rate_limit.primary_window', 'rate_limit.secondary_window',
+  ]);
   const extraWindows = new Map();
   profiles.forEach(item => (item.usage?.windows || []).forEach(window => {
     if (!baseKeys.has(window.key)) extraWindows.set(window.key, window.label
@@ -135,7 +148,7 @@ function providerTable(provider) {
         <button class="action-button switch" type="button" data-action="switch" data-provider="${provider}" data-profile="${escapeHtml(item.profile)}"${item.active ? ' disabled' : ''}>${item.active ? 'Aktif' : 'Etkinleştir'}</button>
       </div></td>
     </tr>`;
-  }).join('') : '<tr class="empty-row"><td colspan="7">Bu sağlayıcı için kayıtlı profil yok.</td></tr>';
+  }).join('') : `<tr class="empty-row"><td colspan="${7 + extraWindows.size + (provider === 'codex' ? 1 : 0)}">Bu sağlayıcı için kayıtlı profil yok.</td></tr>`;
 
   return `<section class="provider-section provider-${provider}" style="--provider:var(--${provider});--active-soft:var(--${provider}-soft)">
     <div class="provider-heading">
@@ -144,7 +157,7 @@ function providerTable(provider) {
     </div>
     <div class="table-wrap">
       <table class="account-table">
-        <thead><tr><th>Profil</th><th>Hesap</th><th>Plan</th><th>5 saat</th><th>7 gün</th>${Array.from(extraWindows.values()).map(label => `<th>${escapeHtml(label)}</th>`).join('')}${provider === 'codex' ? '<th>Limit sıfırlama / kredi</th>' : ''}<th>Abonelik</th><th>İşlemler</th></tr></thead>
+        <thead><tr><th>Profil</th><th>Hesap</th><th>Plan</th><th>${isAgy ? 'Gemini · 5 saat' : '5 saat'}</th><th>${isAgy ? 'Gemini · 7 gün' : '7 gün'}</th>${Array.from(extraWindows.values()).map(label => `<th>${escapeHtml(label)}</th>`).join('')}${provider === 'codex' ? '<th>Limit sıfırlama / kredi</th>' : ''}<th>Abonelik</th><th>İşlemler</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
@@ -152,7 +165,7 @@ function providerTable(provider) {
 }
 
 function renderProfiles() {
-  tablesRoot.innerHTML = providerTable('claude') + providerTable('codex') + providerTable('opencode');
+  tablesRoot.innerHTML = providerTable('claude') + providerTable('codex') + providerTable('agy') + providerTable('opencode');
 }
 
 function render() {
@@ -250,7 +263,7 @@ function openSwitch(provider, profile) {
   const item = findProfile(provider, profile);
   if (!item) return;
   switchTarget = { provider, profile };
-  document.getElementById('switchDescription').textContent = `${item.email || profile} hesabı ${provider === 'opencode' ? 'OpenCode Go' : provider === 'claude' ? 'Claude Code' : 'Codex CLI'} için aktif profil olacak. Mevcut aktif profil önce otomatik kaydedilir. ${provider === 'opencode' ? 'Yeni anahtarın kullanılması için açık OpenCode oturumunu yeniden başlatın.' : 'Açık bir CLI oturumu varsa ayrıca onay istenir.'}`;
+  document.getElementById('switchDescription').textContent = `${item.email || profile} hesabı ${providerLabel(provider)} için aktif profil olacak. Mevcut aktif profil önce otomatik kaydedilir. ${provider === 'opencode' ? 'Yeni anahtarın kullanılması için açık OpenCode oturumunu yeniden başlatın.' : 'Açık bir CLI oturumu varsa ayrıca onay istenir.'}`;
   switchDialog.showModal();
 }
 
@@ -294,7 +307,7 @@ function openWake(provider, profile) {
   if (!item) return;
   const wake = item.wake || {};
   const defaultWake = new Date(Date.now() + 5 * 60 * 1000);
-  document.getElementById('wakeTitle').textContent = `${profile} / ${provider === 'opencode' ? 'OpenCode Go' : provider === 'claude' ? 'Claude Code' : 'Codex CLI'}`;
+  document.getElementById('wakeTitle').textContent = `${profile} / ${providerLabel(provider)}`;
   document.getElementById('wakeProvider').value = provider;
   document.getElementById('wakeProfile').value = profile;
   document.getElementById('wakeEnabled').checked = true;
@@ -342,7 +355,7 @@ async function confirmSwitch() {
       const sessions = error.data?.active_sessions;
       if (!sessions?.length || error.data?.can_kill === false) throw error;
       const listing = sessions.map(item => `PID ${item.pid}: ${item.command}`).join('\n');
-      const confirmed = window.confirm(`Açık ${provider === 'opencode' ? 'OpenCode Go' : provider === 'claude' ? 'Claude Code' : 'Codex CLI'} oturum(lar)ı var:\n\n${listing}\n\nBunları durdurup devam edeyim mi?`);
+      const confirmed = window.confirm(`Açık ${providerLabel(provider)} oturum(lar)ı var:\n\n${listing}\n\nBunları durdurup devam edeyim mi?`);
       if (!confirmed) throw error;
       result = await requestSwitch(provider, profile, true);
     }

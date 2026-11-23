@@ -154,9 +154,34 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(try_other(), b"True")
 
     def test_wake_treats_leading_hyphen_prompt_as_positional(self):
-        for name in ("claude", "codex"):
+        for name in ("claude", "codex", "agy"):
             cmd = ACCX["wake_command"](ACCX["Provider"](name), "--sample-option")
             self.assertEqual(cmd[-2:], ["--", "--sample-option"])
+
+    def test_agy_runtime_prepare_and_snapshot_projection(self):
+        agy = ACCX["Provider"]("agy")
+        pdir = agy.profile_dir("personal")
+        pdir.mkdir(parents=True)
+        (pdir / "credential.json").write_text(json.dumps({
+            "token": {"access_token": "secret-agy-access", "refresh_token": "secret-agy-refresh", "expiry": "2032-01-02T03:04:00Z"},
+            "id_token_email": "agy-secret@example.test",
+        }))
+        (pdir / "meta.json").write_text(json.dumps({"identity": {"email": "agy-secret@example.test", "plan": "ultra"}}))
+        agy.stored_cache_path("personal").write_text(json.dumps({
+            "fetched_at": ACCX["now_iso"](),
+            "raw": {"quotaSummary": {"groups": [{"buckets": [{"bucketId": "gemini-5h", "remainingFraction": 0.4, "resetTime": "2032-01-02T03:04:00Z"}]}]}},
+        }))
+        target = {"provider": "agy", "profile_id": ACCX["machine_profile_id"](agy, "personal")}
+        with patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(Path(self.temp) / "agy")}):
+            snap = self.call("snapshot")
+            agy_item = next(p for p in snap["result"]["profiles"] if p["provider"] == "agy")
+            self.assertEqual(agy_item["plan"], "ultra")
+            self.assertEqual(agy_item["usage"]["windows"][0]["used_percent"], 60.0)
+            self.assertNotIn("secret-", json.dumps(snap))
+            self.assertNotIn("agy-secret@example.test", json.dumps(snap))
+            prep = self.call("runtime.prepare", target)
+            self.assertEqual(prep["result"]["status"], "ready")
+            self.assertTrue((Path(prep["result"]["path"]) / "antigravity-oauth-token").exists())
 
     def test_actual_wake_completion_updates_corresponding_execution(self):
         release = threading.Event()

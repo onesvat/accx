@@ -70,7 +70,7 @@ function renderPlans(plans) {
   }
   const sorted = [...plans].sort((a, b) => Number(b.enabled) - Number(a.enabled) || String(a.next_run_at).localeCompare(String(b.next_run_at)));
   const rows = sorted.map(plan => {
-    const providerName = plan.provider === 'claude' ? 'Claude Code' : 'Codex CLI';
+    const providerName = ({ claude: 'Claude Code', codex: 'Codex CLI', agy: 'Antigravity' })[plan.provider] || plan.provider;
     const recurrence = plan.recurrence === 'daily' ? 'Her gün' : 'Tek sefer';
     const output = plan.output
       ? `<details class="table-output"><summary>Göster</summary><pre>${escapeHtml(plan.output)}</pre></details>`
